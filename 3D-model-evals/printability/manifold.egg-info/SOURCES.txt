@@ -1,0 +1,9 @@
+setup.py
+manifold.egg-info/PKG-INFO
+manifold.egg-info/SOURCES.txt
+manifold.egg-info/dependency_links.txt
+manifold.egg-info/not-zip-safe
+manifold.egg-info/top_level.txt
+src/edge.cpp
+src/manifold.cpp
+src/module.cpp

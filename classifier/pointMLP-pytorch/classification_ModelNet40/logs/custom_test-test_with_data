@@ -1,0 +1,4 @@
+  File "custom_test.py", line 98
+    print("\tmin:",np.min(data.cpu().numpy())
+    ^
+SyntaxError: invalid syntax

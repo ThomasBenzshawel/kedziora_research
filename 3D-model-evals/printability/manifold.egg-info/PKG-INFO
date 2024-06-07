@@ -1,0 +1,6 @@
+Metadata-Version: 2.1
+Name: manifold
+Version: 0.0.3
+Summary: Processes STL faces and vertices to evaluate its printability
+Author: Aidan Schneider
+Requires-Python: >=3.7
