@@ -54,6 +54,8 @@ for category in _shapenet_categories:
         model_path = os.path.join(category_dir, model_id)
         v, f = pcu.load_mesh_vf(os.path.join(model_path))
         
+        
+        # Kinda hacky, but sometimes the sampling fails
         try:
             fid, bc = pcu.sample_mesh_random(v, f, sample_pcs_num)
             ref_xyz = pcu.interpolate_barycentric_coords(f, fid, bc, v)
