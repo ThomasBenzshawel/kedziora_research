@@ -23,6 +23,19 @@
     * https://www.gamedeveloper.com/business/sega-teams-with-ai-startup-eques-on-voxel-generation-tool
     * Text to voxel exists with Meshy: https://www.youtube.com/watch?v=0pIXhOXE1W0
 
+
+# Very good Resource
+    - https://www.meshlab.net/
+
+# FVDB is very good for a representing our 3D data, no documentation tho
+    - https://research.nvidia.com/labs/prl/publication/williams2024fvdb/
+
+
+# Very good for training, never seen this before, but now we don't have to deal with making a sharding enabled model!
+    - https://lightning.ai/docs/pytorch/stable/
+
+
+
 # OUR DATA SET
 * https://objaverse.allenai.org/
 
