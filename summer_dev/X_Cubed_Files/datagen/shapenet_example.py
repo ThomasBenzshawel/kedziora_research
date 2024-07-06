@@ -68,7 +68,7 @@ for category in _shapenet_categories:
                 
         ijk = pcu.voxelize_triangle_mesh(v, f.astype(np.int32), vox_size, np.zeros(3))
         grid = fvdb.sparse_grid_from_ijk(fvdb.JaggedTensor([torch.from_numpy(ijk).cuda()]), voxel_sizes=vox_size, origins=[vox_size / 2.] * 3)
-        
+    
         # get normal ref
         ref_xyz = torch.from_numpy(ref_xyz).float().cuda()
         ref_normal = torch.from_numpy(ref_normal).float().cuda()

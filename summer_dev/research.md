@@ -34,8 +34,14 @@
 # Very good for training, never seen this before, but now we don't have to deal with making a sharding enabled model!
     - https://lightning.ai/docs/pytorch/stable/
 
+# Other useful models
+
+    - https://github.com/threestudio-project/threestudio?tab=readme-ov-file#zero-1-to-3-
+    
 
 
 # OUR DATA SET
 * https://objaverse.allenai.org/
+
+
 
