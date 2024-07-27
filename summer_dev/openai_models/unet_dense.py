@@ -6,9 +6,6 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
-# import fvdb
-# import fvdb.nn as fvnn
-# from fvdb.nn import VDBTensor
 
 from summer_dev.openai_models.util import (
     checkpoint,
@@ -637,7 +634,7 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, data: VDBTensor, timesteps=None, context=None, y=None, **kwargs):
+    def forward(self, data, timesteps=None, context=None, y=None, **kwargs):
         """
         Apply the model to an input batch.
         :param x: an [N x C x ...] Tensor of inputs.
@@ -647,7 +644,7 @@ class UNetModel(nn.Module):
         :return: an [N x C x ...] Tensor of outputs.
         """
         # first transfer x to dense torch tensor
-        x = data.to_dense().permute(0, 4, 1, 2, 3).contiguous()
+        x = data.permute(0, 4, 1, 2, 3).contiguous()
         assert (y is not None) == (
             self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
@@ -673,4 +670,4 @@ class UNetModel(nn.Module):
             h = self.id_predictor(h)
         else:
             h = self.out(h)
-        return VDBTensor(data.grid, data.grid.read_from_dense(h.permute(0, 2, 3, 4, 1).contiguous(), dense_origins=th.min(data.grid.ijk.jdata, dim=0)[0])) # TODO: cube to rec
+        return data, h.permute(0, 2, 3, 4, 1).contiguous()
