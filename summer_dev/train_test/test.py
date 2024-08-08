@@ -4,7 +4,7 @@ import os
 
 import omegaconf
 
-from xcube.utils import wandb_util
+from summer_dev.utils import wandb_util
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
