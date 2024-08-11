@@ -1,28 +1,21 @@
-# Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
-#
-# NVIDIA CORPORATION & AFFILIATES and its licensors retain all intellectual property
-# and proprietary rights in and to this software, related documentation
-# and any modifications thereto.  Any use, reproduction, disclosure or
-# distribution of this software and related documentation without an express
-# license agreement from NVIDIA CORPORATION & AFFILIATES is strictly prohibited.
 
 import gc
 
-import fvdb
-import fvdb.nn as fvnn
+# import fvdb
+# import fvdb.nn as fvnn
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 from loguru import logger
 
-from xcube.models.base_model import BaseModel
-from xcube.data.base import DatasetSpec as DS
-from xcube.data.base import list_collate
-from xcube.modules.autoencoding.hparams import hparams_handler
-from xcube.modules.autoencoding.base_encoder import Encoder
-from xcube.modules.autoencoding.losses.base_loss import Loss
-from xcube.modules.autoencoding.sunet import StructPredictionNet
+from models.base_model import BaseModel
+from data.base import DatasetSpec as DS
+from data.base import list_collate
+from modules.autoencoding.hparams import hparams_handler
+from modules.autoencoding.base_encoder import Encoder
+from modules.autoencoding.losses.base_loss import Loss
+from modules.autoencoding.sunet import StructPredictionNet
 
 def reparametrize(mu, logvar):
     std = logvar.div(2).exp()

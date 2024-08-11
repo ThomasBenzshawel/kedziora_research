@@ -31,8 +31,8 @@ from torch.utils.data import DataLoader
 from torch.utils.data.dataloader import default_collate
 from torch.utils.tensorboard.summary import hparams
 
-from xcube.utils import exp
-from xcube.utils.loss_util import AverageMeter
+from utils import exp
+from utils.loss_util import AverageMeter
 
 def lambda_lr_wrapper(it, lr_config, batch_size):
     return max(
@@ -93,7 +93,7 @@ class BaseModel(pl.LightningModule):
             print("No model found.")
             return None
 
-        basis_net_module = importlib.import_module("xcube.models." + config_args.model).Model
+        basis_net_module = importlib.import_module("models." + config_args.model).Model
 
         if weight_path is not None:
             net_module = basis_net_module.load_from_checkpoint(weight_path, hparams=config_args)
@@ -132,7 +132,7 @@ class BaseModel(pl.LightningModule):
             exp.logger.warning(f"Training-step OOM. Skipping.")
 
             try:
-                from xcube.data.base import DatasetSpec as DS
+                from data.base import DatasetSpec as DS
                 exp.logger.warning(f"The problematic batch is: {args[0][DS.SHAPE_NAME]}")
             except:
                 pass
@@ -489,7 +489,7 @@ class BaseModel(pl.LightningModule):
 
     def train_dataloader(self):
         # Note:
-        import xcube.data as dataset
+        import data as dataset
         train_set = dataset.build_dataset(
             self.hparams.train_dataset, self.get_dataset_spec(), self.hparams, self.hparams.train_kwargs)
         torch.manual_seed(0)
@@ -497,14 +497,14 @@ class BaseModel(pl.LightningModule):
                           num_workers=self.hparams.train_val_num_workers, collate_fn=self.get_collate_fn())
 
     def val_dataloader(self):
-        import xcube.data as dataset
+        import data as dataset
         val_set = dataset.build_dataset(
             self.hparams.val_dataset, self.get_dataset_spec(), self.hparams, self.hparams.val_kwargs)
         return DataLoader(val_set, batch_size=self.hparams.batch_size // self.trainer.world_size, shuffle=False,
                           num_workers=self.hparams.train_val_num_workers, collate_fn=self.get_collate_fn())
 
     def test_dataloader(self):
-        import xcube.data as dataset
+        import data as dataset
         self.hparams.test_kwargs.resolution = self.hparams.resolution # ! use for testing when training on X^3 but testing on Y^3
 
         test_set = dataset.build_dataset(

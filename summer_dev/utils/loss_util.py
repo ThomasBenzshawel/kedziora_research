@@ -3,7 +3,7 @@ from collections import OrderedDict
 import pickle
 import torch
 
-from xcube.utils.exp import ConsoleColor
+from utils.exp import ConsoleColor
 
 class TorchLossMeter:
     """
