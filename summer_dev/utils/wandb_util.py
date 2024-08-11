@@ -8,7 +8,7 @@ import flatten_dict
 import torch
 import wandb
 from loguru import logger
-from summer_dev.utils.exp import ConsoleColor
+from utils.exp import ConsoleColor
 
 def _rebuild_cfg(d):
     if isinstance(d, dict):
