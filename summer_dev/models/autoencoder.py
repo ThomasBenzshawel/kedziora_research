@@ -1,8 +1,8 @@
 
 import gc
 
-# import fvdb
-# import fvdb.nn as fvnn
+import fvdb
+import fvdb.nn as fvnn
 import numpy as np
 import torch
 import torch.nn.functional as F
