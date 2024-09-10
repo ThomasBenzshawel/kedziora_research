@@ -45,3 +45,22 @@
 
 
 
+# More data?
+- Shape Net
+https://changeit3d.github.io/
+
+
+
+# Data Augmentation
+https://medium.com/lightricks-tech-blog/using-visual-llms-in-large-scale-multi-label-image-classification-pipelines-8fadbb6a1b2c
+
+Simple enough to code out and get some clean data augmentation going for free.
+
+https://support.prodi.gy/t/recipe-for-batch-wise-labelling-using-both-a-local-model-and-an-llm/7248
+https://prodi.gy/buy
+
+Code "recipe" market for this is a 400 dollar buy in.
+
+https://arxiv.org/abs/2407.07053
+
+https://encord.com/blog/top-multimodal-annotation-tools/
