@@ -39,11 +39,6 @@ from xcube.modules.encoders import (SemanticEncoder, ClassEmbedder, PointNetEnco
 def is_rank_node_zero():
     return os.environ.get('NODE_RANK', '0') == '0'
 
-def lambda_lr_wrapper(it, lr_config, batch_size):
-    return max(
-        lr_config['decay_mult'] ** (int(it / lr_config['decay_step'])),
-        lr_config['clip'] / lr_config['init'])
-
 class Model(BaseModel):
     def __init__(self, hparams):
         super().__init__(hparams)
@@ -128,6 +123,7 @@ class Model(BaseModel):
         logger.info(f"num_input_channels: {num_input_channels}, out_channels: {out_channels}, \
                     num_classes: {num_classes}, context_dim: {context_dim}, concat_dim: {concat_dim} \
                     conditioning_key: {self.hparams.conditioning_key}")
+        
         self.unet = eval(self.hparams.network.diffuser_name)(num_input_channels=num_input_channels, 
                                                              out_channels=out_channels, 
                                                              num_classes=num_classes,
@@ -481,7 +477,8 @@ class Model(BaseModel):
 
     @exp.mem_profile(every=1)
     def forward(self, batch, out: dict):
-        # first get latent from vae
+        # first get latent from vae, the latent is the input to the diffusion model
+        # A latent is the encoded feature from the input
         with torch.no_grad():
             latents = self.vae._encode(batch, use_mode=False)
 
@@ -519,6 +516,8 @@ class Model(BaseModel):
         # Predict the noise residual and compute loss
         # forward_cond function use batch-level timesteps
         noisy_latents = VDBTensor(grid=latents.grid, feature=latents.grid.jagged_like(noisy_latents))
+        # Model prediction
+        # This is where a lot of work is going on
         model_pred = self._forward_cond(noisy_latents, timesteps, batch)
 
         out.update({'pred': model_pred.feature.jdata})
@@ -770,6 +769,7 @@ class Model(BaseModel):
             latent_model_input = scheduler.scale_model_input(latent_model_input, t)
             # predict the noise residual
             latent_model_input = VDBTensor(grid=grids, feature=grids.jagged_like(latent_model_input))
+            # Predict the noise residual
             noise_pred = self._forward_cond(latent_model_input, t, cond_dict=cond_dict, is_testing=True, guidance_scale=guidance_scale) # TODO: cond
             # compute the previous noisy sample x_t -> x_t-1
             latents = scheduler.step(noise_pred.feature.jdata, t, latents).prev_sample # TODO: when there is scale model input, why there is latents
