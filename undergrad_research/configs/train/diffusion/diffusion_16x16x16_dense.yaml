@@ -1,5 +1,8 @@
 model: diffusion
 
+# python train.py ./configs/shapenet/chair/train_diffusion_16x16x16_dense.yaml
+# --wname 16x16x16_kld-0.03 --eval_interval 5 --gpus 8 --batch_size 8 --accumulate_grad_batches 4
+
 vae_config: ""
 vae_checkpoint: ""
 
