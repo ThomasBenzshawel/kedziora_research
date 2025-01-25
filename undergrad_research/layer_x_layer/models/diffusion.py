@@ -41,116 +41,7 @@ from xcube_refactored.modules.diffusionmodules.openaimodel.unet_sparse_crossattn
 from xcube_refactored.modules.encoders import (SemanticEncoder, ClassEmbedder, PointNetEncoder,
                                     StructEncoder, StructEncoder3D, StructEncoder3D_remain_h, StructEncoder3D_v2)
 
-class BaseModel(pl.LightningModule):
-    def __init__(self, hparams):
-        super().__init__()
-        self.save_hyperparameters(hparams)
-        self.best_metrics = AverageMeter()
-        # step -> log_name -> log_value (list of ordered-dict)
-        self.test_logged_values = []
-        self.record_folder = None
-        self.record_headers = []
-        self.record_data_cache = {}
-        self.last_test_valid = False
-        self.render_backend = 'pyrender'
-        self.num_oom = 0
 
-    @staticmethod
-    def load_module(spec_path, weight_path=None, overwrite_config=None):
-        """
-        Load a module given spec_path
-        :param spec_path: Path to a model yaml file or ckpt. If is a ckpt file, then weight will also be loaded.
-        :param weight_path: Path to the model weight. If explicitly set to 'NO_LOAD', then even if ckpt is provided to
-            spec_path, no weights will be loaded into the model.
-        :param overwrite_config: argparse.Namespace object, if you want to overwrite the original config.
-        :return: the module class, possibly with weight loaded.
-        """
-        if spec_path is not None:
-            spec_path = Path(spec_path)
-            if spec_path.suffix == ".ckpt":
-                # Boil down spec path using glob.
-                import glob2
-                possible_paths = glob2.glob(str(spec_path))
-                if len(possible_paths) == 1:
-                    spec_path = Path(possible_paths[0])
-                else:
-                    raise AssertionError
-                config_yaml_path = spec_path.parent.parent / "hparams.yaml"
-                if weight_path == "NO_LOAD":
-                    weight_path = None
-                elif weight_path is None:
-                    weight_path = spec_path
-            elif spec_path.suffix == ".yaml":
-                config_yaml_path = spec_path
-            else:
-                raise NotImplementedError
-
-            config_args = exp.parse_config_yaml(config_yaml_path, overwrite_config, override=False)
-        else:
-            config_args = overwrite_config
-
-        if "model" not in config_args.keys():
-            print("No model found.")
-            return None
-
-        basis_net_module = importlib.import_module("xcube.models." + config_args.model).Model
-
-        if weight_path is not None:
-            net_module = basis_net_module.load_from_checkpoint(weight_path, hparams=config_args)
-        else:
-            net_module = basis_net_module(config_args)
-
-        return net_module
-
-    def training_step(self, *args, **kwargs):
-        try:
-            return self.train_val_step(is_val=False, *args, **kwargs)
-        except RuntimeError:
-            # Compare to post-mortem, this would allow training to continue...
-            exp.logger.warning(f"Training-step OOM. Skipping.")
-
-            try:
-                from xcube.data.base import DatasetSpec as DS
-                exp.logger.warning(f"The problematic batch is: {args[0][DS.SHAPE_NAME]}")
-            except:
-                pass
-
-            traceback.print_exc()
-            gc.collect()
-            torch.cuda.empty_cache()
-            self.num_oom += 1.0
-            self.log("num_oom", self.num_oom)
-            return None
-
-
-
-    def train_dataloader(self):
-        # Note:
-        import xcube.data as dataset
-        train_set = dataset.build_dataset(
-            self.hparams.train_dataset, self.get_dataset_spec(), self.hparams, self.hparams.train_kwargs)
-        torch.manual_seed(0)
-        return DataLoader(train_set, batch_size=self.hparams.batch_size // self.trainer.world_size, shuffle=True,
-                          num_workers=self.hparams.train_val_num_workers, collate_fn=self.get_collate_fn())
-
-    def val_dataloader(self):
-        import xcube.data as dataset
-        val_set = dataset.build_dataset(
-            self.hparams.val_dataset, self.get_dataset_spec(), self.hparams, self.hparams.val_kwargs)
-        return DataLoader(val_set, batch_size=self.hparams.batch_size // self.trainer.world_size, shuffle=False,
-                          num_workers=self.hparams.train_val_num_workers, collate_fn=self.get_collate_fn())
-
-    def test_dataloader(self):
-        import xcube.data as dataset
-        self.hparams.test_kwargs.resolution = self.hparams.resolution # ! use for testing when training on X^3 but testing on Y^3
-
-        test_set = dataset.build_dataset(
-            self.hparams.test_dataset, self.get_dataset_spec(), self.hparams, self.hparams.test_kwargs)
-        if self.hparams.test_set_shuffle:
-            torch.manual_seed(0)
-        return DataLoader(test_set, batch_size=1, shuffle=self.hparams.test_set_shuffle, 
-                          num_workers=0, collate_fn=self.get_collate_fn())
-    
 class Embedder(nn.Module):
     def __init__(self, include_input=True, input_dims=3, max_freq_log2=10, num_freqs=10, log_sampling=True, periodic_fns=[torch.sin, torch.cos]):
         super().__init__()
@@ -273,9 +164,6 @@ def list_collate(batch):
     # raise NotImplementedError
     return batch
 
-
-def is_rank_node_zero():
-    return os.environ.get('NODE_RANK', '0') == '0'
 
 class Model(BaseModel):
     def __init__(self, hparams):
@@ -1014,9 +902,6 @@ class Model(BaseModel):
         
         return VDBTensor(grid=grids, feature=grids.jagged_like(latents))
     
-
-
-
     def get_dataset_spec(self):
         all_specs = self.vae.get_dataset_spec()
         # further add new specs
@@ -1024,30 +909,6 @@ class Model(BaseModel):
             all_specs.append(DatasetSpec.TEXT_EMBEDDING)
             all_specs.append(DatasetSpec.TEXT_EMBEDDING_MASK)
         return all_specs
-    
+
     def get_collate_fn(self):
         return list_collate
-    
-    def get_hparams_metrics(self):
-        return [('val_loss', True)]
-
-    def train_dataloader(self):
-        import xcube.data as dataset
-        from torch.utils.data import DataLoader
-
-        shuffle = True
-        train_set = dataset.build_dataset(
-            self.hparams.train_dataset, self.get_dataset_spec(), self.hparams, self.hparams.train_kwargs, duplicate_num=self.hparams.duplicate_num) # !: A change here for adding duplicate num for trainset without lantet
-
-        batch_size = self.hparams.batch_size
-        
-        return DataLoader(train_set, batch_size=batch_size, shuffle=shuffle,
-                          num_workers=self.hparams.train_val_num_workers, collate_fn=self.get_collate_fn())
-
-    def val_dataloader(self):
-        import xcube.data as dataset
-        from torch.utils.data import DataLoader
-        val_set = dataset.build_dataset(
-            self.hparams.val_dataset, self.get_dataset_spec(), self.hparams, self.hparams.val_kwargs)
-        return DataLoader(val_set, batch_size=self.hparams.batch_size_val, shuffle=False,
-                          num_workers=self.hparams.train_val_num_workers, collate_fn=self.get_collate_fn())
