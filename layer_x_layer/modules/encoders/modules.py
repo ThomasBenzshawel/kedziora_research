@@ -15,7 +15,7 @@ import fvdb.nn as fvnn
 from fvdb import JaggedTensor
 from torch_scatter import scatter_max, scatter_mean
 
-from xcube.modules.autoencoding.sunet import SparseDoubleConv
+from modules.autoencoding.sunet import SparseDoubleConv
 
 
 class ClassEmbedder(nn.Module):

@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from fvdb.nn import VDBTensor
-from loguru import logger
+# from loguru import logger
 from torch.autograd import Variable
 
 
@@ -237,7 +237,7 @@ class StructPredictionNet(nn.Module):
                  use_checkpoint=False, **kwargs):
         super().__init__()
         n_features = [in_channels] + [f_maps * 2 ** k for k in range(num_blocks)]
-        logger.info("latent dim: {}".format(int(n_features[-1] / cut_ratio)))
+        # logger.info("latent dim: {}".format(int(n_features[-1] / cut_ratio)))
         self.encoders = nn.ModuleList()
         self.pre_kl_bottleneck = nn.ModuleList()
         self.post_kl_bottleneck = nn.ModuleList()
