@@ -22,7 +22,7 @@ from numpy.random import RandomState
 from omegaconf import DictConfig, ListConfig
 from torch.utils.data import Dataset
 
-from xcube.utils import exp
+from utils import exp
 
 class DS(Enum):
     SHAPE_NAME = 100
