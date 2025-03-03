@@ -3,3 +3,5 @@
 *slurm*
 *__pycache*
 .vscode
+layer_x_layer/data_gen/ply_files/*
+layer_x_layer/data_gen/glb_conversion.log
