@@ -26,6 +26,7 @@ def convert_single_file(input_path, output_path):
                         output_path,
                         save_vertex_color=True,
                         save_face_color=False,
+                        
                         save_textures=False,
                         binary=True,
                     )

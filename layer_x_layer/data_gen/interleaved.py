@@ -46,8 +46,8 @@ def image_data_augmentation(folder_path):
     Never mention the word "3D model" in your description, or explain what you are thinking.
     Please be concise yet extremely descriptive in your response. 
     First classify, then provide a one liner label for the object. Then provide a detailed description of the object.
+    
     An example of your output could be: 
-
     "Label: Cat
     Short Description: A brown cat with a pink nose and green eyes, sitting on a white windowsill looking out the window.
     Long Description: A small brown cat with a pink nose and green eyes, sitting on a white windowsill looking out the window. 
