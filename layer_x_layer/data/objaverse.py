@@ -24,32 +24,8 @@ from torch.utils.data import Dataset
 
 from utils import exp
 
-class DS(Enum):
-    SHAPE_NAME = 100
-    INPUT_PC = 200
-    TARGET_NORMAL = 300
-    INPUT_COLOR = 350
-    INPUT_INTENSITY = 360
-    GT_DENSE_PC = 400
-    GT_DENSE_NORMAL = 500
-    GT_DENSE_COLOR = 550
-    GT_MESH = 600
-    GT_MESH_SOUP = 650
-    GT_ONET_SAMPLE = 700
-    GT_GEOMETRY = 800
-    DATASET_CFG = 1000
-    GT_DYN_FLAG = 1100
-    GT_SEMANTIC = 1200
-    LATENT_SEMANTIC = 1300
-    SINGLE_SCAN_CROP = 1400
-    SINGLE_SCAN_INTENSITY_CROP = 1410
-    SINGLE_SCAN = 1450
-    SINGLE_SCAN_INTENSITY = 1460
-    CLASS = 1500
-    TEXT_EMBEDDING = 1600
-    TEXT_EMBEDDING_MASK = 1610
-    TEXT = 1620
-    MICRO = 1630
+from utils.Dataspec import DatasetSpec
+
 
 class RandomSafeDataset(Dataset):
     """
@@ -184,10 +160,11 @@ class ObjaverseDataset(RandomSafeDataset):
         if '' in models_c:
             models_c.remove('')
         self.models = [{'category': m.split("/")[-2], 'model': m.split("/")[-1]} for m in models_c]
+        # print(self.models)
         self.hparams = hparams
         
         # setup text condition
-        if DS.TEXT_EMBEDDING in self.spec:
+        if DatasetSpec.TEXT_EMBEDDING in self.spec:
             self.text_emb_path = text_emb_path
             self.null_text_emb = torch.load(null_embed_path)
             self.max_text_len = max_text_len
@@ -219,26 +196,25 @@ class ObjaverseDataset(RandomSafeDataset):
         category = self.models[data_id % len(self.models)]['category']
         model = self.models[data_id % len(self.models)]['model']
         data = {}
-        input_data = torch.load(os.path.join(self.onet_base_path, category, model, "%s.pkl" % self.resolution))
+        input_data = torch.load(os.path.join(self.onet_base_path, category, model) + ".pkl")
         input_points = input_data['points']
         input_normals = input_data['normals'].jdata
+        if DatasetSpec.SHAPE_NAME in self.spec:
+            data[DatasetSpec.SHAPE_NAME] = "/".join([category, model])
 
-        if DS.SHAPE_NAME in self.spec:
-            data[DS.SHAPE_NAME] = "/".join([category, model])
-
-        if DS.TARGET_NORMAL in self.spec:
-            data[DS.TARGET_NORMAL] = input_normals
+        if DatasetSpec.TARGET_NORMAL in self.spec:
+            data[DatasetSpec.TARGET_NORMAL] = input_normals
     
-        if DS.INPUT_PC in self.spec:
-            data[DS.INPUT_PC] = input_points
+        if DatasetSpec.INPUT_PC in self.spec:
+            data[DatasetSpec.INPUT_PC] = input_points
                 
-        if DS.GT_DENSE_PC in self.spec:
-            data[DS.GT_DENSE_PC] = input_points
+        if DatasetSpec.GT_DENSE_PC in self.spec:
+            data[DatasetSpec.GT_DENSE_PC] = input_points
 
-        if DS.GT_DENSE_NORMAL in self.spec:
-            data[DS.GT_DENSE_NORMAL] = input_normals
+        if DatasetSpec.GT_DENSE_NORMAL in self.spec:
+            data[DatasetSpec.GT_DENSE_NORMAL] = input_normals
 
-        if DS.TEXT_EMBEDDING in self.spec:
+        if DatasetSpec.TEXT_EMBEDDING in self.spec:
             # first sample prob to drop text embedding
             if random.random() < self.text_embed_drop_prob:
                 # drop the text
@@ -254,8 +230,8 @@ class ObjaverseDataset(RandomSafeDataset):
                 else:
                     text_emb, text_mask = self.get_null_text_emb()
                     caption = ""
-            data[DS.TEXT_EMBEDDING] = text_emb.detach()
-            data[DS.TEXT_EMBEDDING_MASK] = text_mask.detach()
-            data[DS.TEXT] = caption
+            data[DatasetSpec.TEXT_EMBEDDING] = text_emb.detach()
+            data[DatasetSpec.TEXT_EMBEDDING_MASK] = text_mask.detach()
+            data[DatasetSpec.TEXT] = caption
         
         return data
