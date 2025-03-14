@@ -233,5 +233,5 @@ class ObjaverseDataset(RandomSafeDataset):
             data[DatasetSpec.TEXT_EMBEDDING] = text_emb.detach()
             data[DatasetSpec.TEXT_EMBEDDING_MASK] = text_mask.detach()
             data[DatasetSpec.TEXT] = caption
-        
+        # print(data)
         return data
