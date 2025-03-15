@@ -448,7 +448,7 @@ class StructPredictionNet(nn.Module):
 
         for module in self.pre_kl_bottleneck:
             x, _ = module(x)
-        dec_main_feature = x.feature.jdata
+        dec_main_feature = x.jdata
         mu, log_sigma = torch.chunk(dec_main_feature, 2, dim=1)
 
         return res, x, mu, log_sigma

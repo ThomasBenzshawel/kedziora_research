@@ -196,7 +196,7 @@ class ObjaverseDataset(RandomSafeDataset):
         category = self.models[data_id % len(self.models)]['category']
         model = self.models[data_id % len(self.models)]['model']
         data = {}
-        input_data = torch.load(os.path.join(self.onet_base_path, category, model) + ".pkl")
+        input_data = torch.load(os.path.join(self.onet_base_path, category, model) + ".pkl", weights_only=False)
         input_points = input_data['points']
         input_normals = input_data['normals'].jdata
         if DatasetSpec.SHAPE_NAME in self.spec:
