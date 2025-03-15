@@ -392,7 +392,7 @@ class StructPredictionNet(nn.Module):
     @classmethod
     def sparse_zero_padding(cls, in_x: fvnn.VDBTensor, target_grid: fvdb.GridBatch):
         source_grid = in_x.grid
-        source_feature = in_x.feature.jdata
+        source_feature = in_x.jdata
         assert torch.allclose(source_grid.origins, target_grid.origins)
         assert torch.allclose(source_grid.voxel_sizes, target_grid.voxel_sizes)
         out_feat = torch.zeros((target_grid.total_voxels, source_feature.size(1)),
@@ -405,13 +405,13 @@ class StructPredictionNet(nn.Module):
     @classmethod
     def struct_to_mask(cls, struct_pred: fvnn.VDBTensor):
         # 0 is exist, 1 is non-exist
-        mask = struct_pred.feature.jdata[:, 0] > struct_pred.feature.jdata[:, 1]
+        mask = struct_pred.jdata[:, 0] > struct_pred.jdata[:, 1]
         return struct_pred.grid.jagged_like(mask)
 
     @classmethod
     def cat(cls, x: fvnn.VDBTensor, y: fvnn.VDBTensor):
         assert x.grid == y.grid
-        return fvnn.VDBTensor(x.grid, x.grid.jagged_like(torch.cat([x.feature.jdata, y.feature.jdata], dim=1)))
+        return fvnn.VDBTensor(x.grid, x.grid.jagged_like(torch.cat([x.jdata, y.jdata], dim=1)))
     
     class FeaturesSet:
         def __init__(self):
@@ -456,7 +456,7 @@ class StructPredictionNet(nn.Module):
 
         for module in self.pre_kl_bottleneck:
             x, _ = module(x)
-        dec_main_feature = x.feature.jdata
+        dec_main_feature = x.jdata
         mu, log_sigma = torch.chunk(dec_main_feature, 2, dim=1)
 
         return res, x, mu, log_sigma
