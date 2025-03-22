@@ -20,9 +20,9 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import torch
 
-from xcube.modules.diffusionmodules.schedulers.utils import KarrasDiffusionSchedulers
-from xcube.modules.diffusionmodules.schedulers.torch_utils import randn_tensor
-from xcube.modules.diffusionmodules.schedulers.output import SchedulerOutput
+from modules.diffusionmodules.schedulers.utils import KarrasDiffusionSchedulers
+from modules.diffusionmodules.schedulers.torch_utils import randn_tensor
+from modules.diffusionmodules.schedulers.output import SchedulerOutput
 
 # Copied from diffusers.schedulers.scheduling_ddpm.betas_for_alpha_bar
 def betas_for_alpha_bar(

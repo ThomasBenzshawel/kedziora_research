@@ -21,8 +21,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from xcube.modules.diffusionmodules.schedulers.output import BaseOutput
-from xcube.modules.diffusionmodules.schedulers.utils import FrozenDict, rescale_zero_terminal_snr
+from modules.diffusionmodules.schedulers.output import BaseOutput
+from modules.diffusionmodules.schedulers.utils import FrozenDict, rescale_zero_terminal_snr
 
 def get_timestep_embedding(
     timesteps: torch.Tensor,
