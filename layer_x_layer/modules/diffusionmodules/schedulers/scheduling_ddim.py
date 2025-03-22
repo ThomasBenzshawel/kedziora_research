@@ -23,7 +23,7 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import torch
 
-from xcube.modules.diffusionmodules.schedulers.output import BaseOutput
+from modules.diffusionmodules.schedulers.output import BaseOutput
 
 @dataclass
 # Copied from diffusers.schedulers.scheduling_ddpm.DDPMSchedulerOutput with DDPM->DDIM

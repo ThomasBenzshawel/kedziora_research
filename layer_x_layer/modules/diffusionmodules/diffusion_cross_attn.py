@@ -2,12 +2,18 @@ import math
 from typing import Optional, Tuple
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 import fvdb
 import fvdb.nn as fvnn
+from inspect import isfunction
+import math
+import torch.nn.functional as F
+from torch import nn, einsum
+
+from einops import rearrange, repeat
 from fvdb.nn import VDBTensor
+
+from modules.diffusionmodules.util import checkpoint, conv_nd
 
 def zero_module(module: nn.Module):
     """Zero out the parameters of a module."""
@@ -38,9 +44,6 @@ def init_(tensor):
     std = 1 / math.sqrt(dim)
     tensor.uniform_(-std, std)
     return tensor
-
-class GELU(ElementwiseMixin, nn.GELU):
-    pass
 
 class LayerNorm(nn.LayerNorm):
     def forward(self, input: VDBTensor) -> VDBTensor:
