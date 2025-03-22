@@ -13,33 +13,30 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
-from omegaconf import DictConfig, ListConfig, OmegaConf
+# from omegaconf import DictConfig, ListConfig, OmegaConf
 import collections
 from pathlib import Path
-from pytorch_lightning.utilities.distributed import rank_zero_only
 
 
-from xcube_refactored.utils import exp
-from xcube_refactored.utils.vis_util import vis_pcs
+from utils import exp
+
+from modules.diffusionmodules.schedulers.scheduling_ddim import DDIMScheduler
+from modules.diffusionmodules.schedulers.scheduling_ddpm import DDPMScheduler
+from modules.diffusionmodules.schedulers.scheduling_dpmpp_2m import DPMSolverMultistepScheduler
 
 
-from xcube_refactored.modules.diffusionmodules.schedulers.scheduling_ddim import DDIMScheduler
-from xcube_refactored.modules.diffusionmodules.schedulers.scheduling_ddpm import DDPMScheduler
-from xcube_refactored.modules.diffusionmodules.schedulers.scheduling_dpmpp_2m import DPMSolverMultistepScheduler
+from modules.diffusionmodules.ema import LitEma
 
 
-from xcube_refactored.modules.diffusionmodules.ema import LitEma
-
-
-# Why aren't these used??????
-from xcube_refactored.modules.diffusionmodules.openaimodel.unet_dense import UNetModel as UNetModel_Dense
-from xcube_refactored.modules.diffusionmodules.openaimodel.unet_sparse import UNetModel as UNetModel_Sparse
-from xcube_refactored.modules.diffusionmodules.openaimodel.unet_sparse_crossattn import UNetModel as UNetModel_Sparse_CrossAttn
+from modules.diffusionmodules.diffusion_sparse_attn import UNetModel as UNetModel_Sparse
+from modules.diffusionmodules.diffusion_cross_attn import UNetModel as UNetModel_Sparse_CrossAttn
 
 
 # Why aren't these used??????
-from xcube_refactored.modules.encoders import (SemanticEncoder, ClassEmbedder, PointNetEncoder,
+from modules.encoders import (SemanticEncoder, ClassEmbedder, PointNetEncoder,
                                     StructEncoder, StructEncoder3D, StructEncoder3D_remain_h, StructEncoder3D_v2)
+
+from utils.Dataspec import DatasetSpec as DS
 
 
 class Embedder(nn.Module):
@@ -88,84 +85,9 @@ def get_embedder(multires, i=0, input_dims=3):
     embedder_obj = Embedder(max_freq_log2=multires-1, num_freqs=multires, input_dims=input_dims)
     return embedder_obj, embedder_obj.out_dim
 
-class DatasetSpec(Enum):
-    SHAPE_NAME = 100
-    INPUT_PC = 200
-    TARGET_NORMAL = 300
-    INPUT_COLOR = 350
-    INPUT_INTENSITY = 360
-    GT_DENSE_PC = 400
-    GT_DENSE_NORMAL = 500
-    GT_DENSE_COLOR = 550
-    GT_MESH = 600
-    GT_MESH_SOUP = 650
-    GT_ONET_SAMPLE = 700
-    GT_GEOMETRY = 800
-    DATASET_CFG = 1000
-    GT_DYN_FLAG = 1100
-    GT_SEMANTIC = 1200
-    LATENT_SEMANTIC = 1300
-    SINGLE_SCAN_CROP = 1400
-    SINGLE_SCAN_INTENSITY_CROP = 1410
-    SINGLE_SCAN = 1450
-    SINGLE_SCAN_INTENSITY = 1460
-    CLASS = 1500
-    TEXT_EMBEDDING = 1600
-    TEXT_EMBEDDING_MASK = 1610
-    TEXT = 1620
-    MICRO = 1630
-
-def list_collate(batch):
-    """
-    This just do not stack batch dimension.
-    """
-    from fvdb import GridBatch, JaggedTensor
-
-    elem = None
-    for e in batch:
-        if e is not None:
-            elem = e
-            break
-    elem_type = type(elem)
-    if isinstance(elem, torch.Tensor):
-        return batch
-    elif elem_type.__module__ == 'numpy' and elem_type.__name__ != 'str_' \
-            and elem_type.__name__ != 'string_':
-        if elem_type.__name__ == 'ndarray' or elem_type.__name__ == 'memmap':
-            return list_collate([torch.as_tensor(b) if b is not None else None for b in batch])
-        elif elem.shape == ():  # scalars
-            return torch.as_tensor(batch)
-    elif isinstance(elem, float):
-        return torch.tensor(batch, dtype=torch.float64)
-    elif isinstance(elem, int):
-        return torch.tensor(batch)
-    elif isinstance(elem, str):
-        return batch
-    elif isinstance(elem, DictConfig) or isinstance(elem, ListConfig):
-        return batch
-    elif isinstance(elem, collections.abc.Mapping):
-        return {key: list_collate([d[key] for d in batch]) for key in elem}
-    elif isinstance(elem, collections.abc.Sequence):
-        # check to make sure that the elements in batch have consistent size
-        it = iter(batch)
-        elem_size = len(next(it))
-        if not all(len(elem) == elem_size for elem in it):
-            raise RuntimeError('each element in list of batch should be of equal size')
-        transposed = zip(*batch)
-        return [list_collate(samples) for samples in transposed]
-    elif isinstance(elem, GridBatch):
-        return fvdb.cat(batch)
-    
-    # elif isinstance(elem, pathlib.Path):
-    #     return batch
-    # elif elem is None:
-    #     return batch
-
-    # raise NotImplementedError
-    return batch
 
 
-class Model(BaseModel):
+class DiffusionModel(nn.Module):
     def __init__(self, hparams):
         super().__init__(hparams)
         if not hasattr(self.hparams, 'ema'):
@@ -284,22 +206,6 @@ class Model(BaseModel):
 
 # End HPARAMS and INIT ____________________________________________________________________________________-
 
-    @rank_zero_only
-    @torch.no_grad()
-    def on_train_batch_start(self, batch, batch_idx):
-        # only for very first batch
-        if self.hparams.scale_by_std and self.global_step == 0 and batch_idx == 0 and self.scale_factor == 1.:
-            assert self.scale_factor == 1., 'rather not use custom rescaling and std-rescaling simultaneously'
-            # set rescale weight to 1./std of encodings
-            latents = self.extract_latent(batch)
-            z = latents.feature.jdata.detach()
-            del self.scale_factor
-            self.register_buffer('scale_factor', 1. / z.flatten().std())
-
-    def on_train_batch_end(self, *args, **kwargs):
-        if self.hparams.ema:
-            self.unet_ema(self.unet)
-
     @contextmanager
     def ema_scope(self):
         if self.hparams.ema:
@@ -394,8 +300,8 @@ class Model(BaseModel):
         if self.hparams.use_text_cond:
             # traing-time: get text from batch
             if batch is not None:
-                text_emb = torch.stack(batch[DatasetSpec.TEXT_EMBEDDING]) # B, 77, 1024
-                mask = torch.stack(batch[DatasetSpec.TEXT_EMBEDDING_MASK]) # B, 77
+                text_emb = torch.stack(batch[DS.TEXT_EMBEDDING]) # B, 77, 1024
+                mask = torch.stack(batch[DS.TEXT_EMBEDDING_MASK]) # B, 77
             else:
                 text_emb = cond_dict['text_emb']
                 mask = cond_dict['text_emb_mask']                
@@ -411,7 +317,7 @@ class Model(BaseModel):
         if self.hparams.use_semantic_cond:
             # traing-time: get semantic from batch
             if batch is not None:
-                input_semantic = fvdb.JaggedTensor(batch[DatasetSpec.LATENT_SEMANTIC])
+                input_semantic = fvdb.JaggedTensor(batch[DS.LATENT_SEMANTIC])
             else:
                 input_semantic = cond_dict['semantics']
             semantic_cond = self.cond_stage_model(input_semantic.jdata.long())
@@ -424,8 +330,8 @@ class Model(BaseModel):
         if self.hparams.use_text_cond:
             # traing-time: get text from batch
             if batch is not None:
-                text_emb = torch.stack(batch[DatasetSpec.TEXT_EMBEDDING]) # B, 77, 1024
-                mask = torch.stack(batch[DatasetSpec.TEXT_EMBEDDING_MASK]) # B, 77
+                text_emb = torch.stack(batch[DS.TEXT_EMBEDDING]) # B, 77, 1024
+                mask = torch.stack(batch[DS.TEXT_EMBEDDING_MASK]) # B, 77
             else:
                 text_emb = cond_dict['text_emb']
                 mask = cond_dict['text_emb_mask']                
@@ -452,126 +358,8 @@ class Model(BaseModel):
         out.update({'target': target})
 
         return out
-    
 
-    # Pcs stands for point clouds ???
-    def get_random_sample_pcs(self, ijk: fvdb.JaggedTensor, batch_size=1, M=3, use_center=False):
-        # M: sample per point
-        # !: be careful about the batch_size
-        output_ijk = []
-        for idx in range(batch_size):
-            current_ijk = ijk[idx].jdata.float() # N, 3
-            if use_center:
-                output_ijk.append(current_ijk)
-            else:            
-                N = current_ijk.shape[0]
-                # create offsets of size M*N x 3 with values in range [-0.5, 0.5]
-                offsets = torch.FloatTensor(N * M, 3).uniform_(-0.5, 0.5).to(current_ijk.device)
-                # duplicate your original point cloud M times
-                expanded_point_cloud = current_ijk.repeat(M, 1)
-                # add offsets to duplicated points
-                expanded_point_cloud += offsets
-                output_ijk.append(expanded_point_cloud)
-        return fvdb.JaggedTensor(output_ijk)
-            
-    def decode_to_points(self, latents):
-        res = self.vae.unet.FeaturesSet()
-        res, output_x = self.vae.unet.decode(res, latents, is_testing=True)
-        grid_tree = res.structure_grid
-        fine_list = []
-        coarse_list = []
-        for batch_idx in range(output_x.grid.grid_count):
-            # fineest level
-            pd_grid_0 = grid_tree[0]
-            pd_xyz_0 = pd_grid_0.grid_to_world(self.get_random_sample_pcs(pd_grid_0.ijk[batch_idx], M=8))
-            fine_list.append(pd_xyz_0.jdata.cpu().numpy())
-            # coarsest level
-            pd_grid_1 = grid_tree[len(grid_tree.keys()) - 1]
-            pd_xyz_1 = pd_grid_1.grid_to_world(self.get_random_sample_pcs(pd_grid_1.ijk[batch_idx], M=3))
-            coarse_list.append(pd_xyz_1.jdata.cpu().numpy())
-        # plot the fine and coarse level
-        viz_fine = vis_pcs(fine_list)
-        viz_coarse = vis_pcs(coarse_list)
-        decode_results = np.concatenate([viz_fine, viz_coarse], axis=0)
-        return decode_results
-    
-    @exp.mem_profile(every=1)
-    def compute_loss(self, batch, out, compute_metric: bool):
-        loss_dict = exp.TorchLossMeter()
-        metric_dict = exp.TorchLossMeter()
 
-        # compute the MSE loss
-        if self.hparams.supervision.mse_weight > 0.0:
-            loss_dict.add_loss("mse", F.mse_loss(out["pred"], out["target"]), self.hparams.supervision.mse_weight)
-        if compute_metric: # currently use MSE as metric
-            metric_dict.add_loss("mse", F.mse_loss(out["pred"], out["target"]))
-
-        return loss_dict, metric_dict 
-    
-
-    # This is an exaple of our training step ______________________________________________________________________________________
-    def train_val_step(self, batch, batch_idx, is_val):
-        if batch_idx % 100 == 0:
-            # Squeeze memory really hard :)   # Why was this commented??????
-            gc.collect()
-            torch.cuda.empty_cache()
-
-        out = {'idx': batch_idx}
-        with exp.pt_profile_named("forward"):
-            out = self(batch, out)
-
-        if out is None and not is_val:
-            return None
-
-        # Compute metric in train would be the out['pred'] and out['target']
-        loss_dict, metric_dict = self.compute_loss(batch, out, compute_metric=is_val)
-
-        if not is_val:
-            self.log_dict_prefix('train_loss', loss_dict)
-        else:
-            self.log_dict_prefix('val_metric', metric_dict)
-            self.log_dict_prefix('val_loss', loss_dict)
-
-            if self.hparams.log_image:
-                cond_dict = {}
-                
-                if self.hparams.use_text_cond:
-                    text_emb = torch.stack(batch[DatasetSpec.TEXT_EMBEDDING]) # B, 77, 1024
-                    mask = torch.stack(batch[DatasetSpec.TEXT_EMBEDDING_MASK]) # B, 77
-                    cond_dict['text_emb'] = text_emb
-                    cond_dict['text_emb_mask'] = mask
-                
-                if self.trainer.global_rank == 0: # only log the image on rank 0
-                    if batch_idx == 0:
-                        with self.ema_scope("Plotting"):
-                            # first extract latent
-
-                            clean_latents = self.extract_latent(batch)
-                            grids = clean_latents.grid
-
-                            # sample latents
-                            sample_latents = self.random_sample_latents(grids, use_ddim=self.hparams.use_ddim, ddim_step=100, cond_dict=cond_dict) # TODO: change this ddim_step to variable
-                            
-                            # decode clean latents first
-                            decode_clean = self.decode_to_points(clean_latents)
-                            # Decode sample latents
-                            decode_sample = self.decode_to_points(sample_latents)
-                            sample = np.concatenate([decode_clean, decode_sample], axis=0)
-                            self.log_image("img/sample", sample)
-                            # clean matplotlib opens
-                            plt.close('all')
-                else:
-                    if batch_idx == 0:
-                        clean_latents = self.extract_latent(batch)
-                        grids = clean_latents.grid
-                        _ = self.random_sample_latents(grids, use_ddim=self.hparams.use_ddim, ddim_step=100, cond_dict=cond_dict) # TODO: change this ddim_step to variable
-
-        loss_sum = loss_dict.get_sum()
-        self.log('val_loss' if is_val else 'train_loss/sum', loss_sum)
-        self.log('val_step', self.global_step)
-
-        return loss_sum
-    
     @torch.no_grad()
     def extract_latent(self, batch):
         return self.vae._encode(batch, use_mode=False)
@@ -670,7 +458,7 @@ class Model(BaseModel):
 
         if do_classifier_free_guidance and len(concat_list) > 0: # ! not tested yet
             if not self.hparams.use_classifier_free:
-                logger.info("Applying classifier-free guidance without doing it for concat condition")
+                # logger.info("Applying classifier-free guidance without doing it for concat condition")
                 concat_list_copy = concat_list
             else:
                 # logger.info("Applying classifier-free guidance for concat condition")    
@@ -746,7 +534,7 @@ class Model(BaseModel):
 
         return model_pred
     
-    # Used for inference / evaluation ______________________________________________________________________________________
+    # Used for inference / evaluation only, not for training
     def evaluation_api(self, batch = None, grids: GridBatch = None, batch_size: int = None, latent_prev: VDBTensor = None, 
                        use_ddim=False, ddim_step=100, use_ema=True, use_dpm=False, use_karras=False, solver_order=3,
                        h_stride=1, guidance_scale: float = 1.0, 
@@ -906,9 +694,6 @@ class Model(BaseModel):
         all_specs = self.vae.get_dataset_spec()
         # further add new specs
         if self.hparams.use_text_cond:
-            all_specs.append(DatasetSpec.TEXT_EMBEDDING)
-            all_specs.append(DatasetSpec.TEXT_EMBEDDING_MASK)
+            all_specs.append(DS.TEXT_EMBEDDING)
+            all_specs.append(DS.TEXT_EMBEDDING_MASK)
         return all_specs
-
-    def get_collate_fn(self):
-        return list_collate
