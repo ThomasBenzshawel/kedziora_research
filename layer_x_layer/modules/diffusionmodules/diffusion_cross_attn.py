@@ -5,6 +5,7 @@ import torch
 
 import fvdb
 import fvdb.nn as fvnn
+from fvdb.nn import VDBTensor
 from inspect import isfunction
 import math
 import torch.nn.functional as F
@@ -12,6 +13,8 @@ from torch import nn, einsum
 
 from einops import rearrange, repeat
 from fvdb.nn import VDBTensor
+from fvdb import JaggedTensor, GridBatch
+from fvdb.nn import GELU
 
 from modules.diffusionmodules.util import checkpoint, conv_nd
 
@@ -47,21 +50,21 @@ def init_(tensor):
 
 class LayerNorm(nn.LayerNorm):
     def forward(self, input: VDBTensor) -> VDBTensor:
-        num_channels = input.feature.jdata.size(1)
+        num_channels = input.jdata.size(1)
         num_batches = input.grid.grid_count
 
-        flat_data, flat_offsets = input.feature.jdata, input.feature.joffsets
+        flat_data, flat_offsets = input.data.jdata, input.data.joffsets
 
         result_data = torch.empty_like(flat_data)
 
         for b in range(num_batches):
-            feat = flat_data[flat_offsets[b, 0]:flat_offsets[b, 1]]
+            feat = flat_data[flat_offsets[b]:flat_offsets[b +1]]
             if feat.size(0) != 0:
                 feat = feat.reshape(1, -1, num_channels)
                 feat = super().forward(feat)
                 feat = feat.reshape(-1, num_channels)
 
-                result_data[flat_offsets[b, 0]:flat_offsets[b, 1]] = feat
+                result_data[flat_offsets[b]:flat_offsets[b + 1]] = feat
 
         return VDBTensor(input.grid, input.grid.jagged_like(result_data), input.kmap)
 
@@ -71,7 +74,7 @@ class GEGLU(nn.Module):
         self.proj = nn.Linear(dim_in, dim_out * 2)
 
     def forward(self, data: VDBTensor):
-        x = data.feature.jdata
+        x = data.jdata
         x, gate = self.proj(x).chunk(2, dim=-1)
         out = x * F.gelu(gate)
         return VDBTensor(data.grid, data.grid.jagged_like(out), data.kmap)
@@ -111,6 +114,71 @@ class Attention(nn.Module):
         
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
+        self.heads = heads
+
+        self.to_q = fvnn.Linear(query_dim, inner_dim, bias=False)
+        self.to_k = fvnn.Linear(context_dim, inner_dim, bias=False)
+        self.to_v = fvnn.Linear(context_dim, inner_dim, bias=False)
+
+        self.to_out = nn.Sequential(
+            fvnn.Linear(inner_dim, query_dim),
+            fvnn.Dropout(dropout)
+        )
+
+    def forward(self, x: VDBTensor):
+        q = self.to_q(x)
+        context = x
+        k = self.to_k(context)
+        v = self.to_v(context)
+        
+        # Get flattened data and offsets
+        q_data, q_offsets = q.data.jdata, q.data.joffsets
+        k_data, k_offsets = k.data.jdata, k.data.joffsets
+        v_data, v_offsets = v.data.jdata, v.data.joffsets
+        
+        num_batches = q.grid.grid_count
+        result_data = torch.empty_like(q_data)
+        
+        for batch_idx in range(num_batches):
+            # Extract batch data using offsets
+            batch_q = q_data[q_offsets[batch_idx]:q_offsets[batch_idx + 1]]
+            batch_k = k_data[k_offsets[batch_idx]:k_offsets[batch_idx + 1]]
+            batch_v = v_data[v_offsets[batch_idx]:v_offsets[batch_idx + 1]]
+            
+            # Skip empty batches
+            if batch_q.size(0) == 0:
+                continue
+                
+            # Process this batch
+            batch_out = self._attention(batch_q, batch_k, batch_v)
+                
+            # Store result back in the output tensor
+            result_data[q_offsets[batch_idx]:q_offsets[batch_idx + 1]] = batch_out
+        
+        # Create a new VDBTensor with the original grid and processed data
+        out = VDBTensor(x.grid, x.grid.jagged_like(result_data), x.kmap)
+        return self.to_out(out)
+    
+    def _attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        # q: (N, C)
+        # k: (77, C)
+        # v: (77, C)
+        # mask: (1, 77)
+        h = self.heads
+        q, k, v = map(lambda t: rearrange(t, '(b n) (h d) -> b h n d', h=h, b=1), (q, k, v))
+        with torch.backends.cuda.sdp_kernel(enable_math=False):
+            out = F.scaled_dot_product_attention(q, k, v)[0] # h, n, d
+        out = rearrange(out, 'h n d -> n (h d)')
+        return out
+    
+
+class OldAttention(nn.Module):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
+        super().__init__()
+        self.scale = dim_head ** -0.5
+        
+        inner_dim = dim_head * heads
+        context_dim = default(context_dim, query_dim)
 
         self.heads = heads
 
@@ -131,7 +199,7 @@ class Attention(nn.Module):
         
         out = []
         for batch_idx in range(q.grid.grid_count):
-            out.append(self._attention(q.feature[batch_idx].jdata, k.feature[batch_idx].jdata, v.feature[batch_idx].jdata))
+            out.append(self._attention(q[batch_idx].jdata, k[batch_idx].jdata, v[batch_idx].jdata))
         out = fvdb.JaggedTensor(out)
         out = VDBTensor(x.grid, out, x.kmap)
         return self.to_out(out)
@@ -168,21 +236,54 @@ class CrossAttention(nn.Module):
             fvnn.Dropout(dropout)
         )
 
+    # def forward(self, x: VDBTensor, context: torch.Tensor=None, mask=None):
+    #     q = self.to_q(x)
+    #     k = self.to_k(context)
+    #     v = self.to_v(context)
+        
+    #     out = []
+        
+    #     for batch_idx in range(q.grid.grid_count):
+    #         if exists(mask):
+    #             mask = rearrange(mask, 'b ... -> b (...)')
+
+    #             out.append(self._attention(q[batch_idx].jdata, k[batch_idx], v[batch_idx], mask=mask[batch_idx:batch_idx+1]))
+    #         else:
+    #             out.append(self._attention(q[batch_idx].jdata, k[batch_idx], v[batch_idx]))
+    #     out = fvdb.JaggedTensor(out)
+    #     out = VDBTensor(x.grid, out, x.kmap)
+    #     return self.to_out(out)
+
     def forward(self, x: VDBTensor, context: torch.Tensor=None, mask=None):
         q = self.to_q(x)
         context = default(context, x)
         k = self.to_k(context)
         v = self.to_v(context)
         
-        out = []
-        for batch_idx in range(q.grid.grid_count):
+        # Get flattened data and offsets
+        q_data, q_offsets = q.data.jdata, q.data.joffsets
+        num_batches = q.grid.grid_count
+        
+        out_data = torch.empty_like(q_data)
+        
+        for batch_idx in range(num_batches):
+            # Extract batch data using offsets
+            batch_q = q_data[q_offsets[batch_idx]:q_offsets[batch_idx + 1]]
+            
+            if batch_q.size(0) == 0:
+                continue
+                
             if exists(mask):
-                mask = rearrange(mask, 'b ... -> b (...)')
-                out.append(self._attention(q.feature[batch_idx].jdata, k[batch_idx], v[batch_idx], mask=mask[batch_idx:batch_idx+1]))
+                batch_mask = mask[batch_idx:batch_idx+1]
+                batch_out = self._attention(batch_q, k[batch_idx], v[batch_idx], mask=batch_mask)
             else:
-                out.append(self._attention(q.feature[batch_idx].jdata, k[batch_idx], v[batch_idx]))
-        out = fvdb.JaggedTensor(out)
-        out = VDBTensor(x.grid, out, x.kmap)
+                batch_out = self._attention(batch_q, k[batch_idx], v[batch_idx])
+                
+            # Store result back in the output tensor
+            out_data[q_offsets[batch_idx]:q_offsets[batch_idx + 1]] = batch_out
+        
+        # Create a new VDBTensor with the original grid and processed data
+        out = VDBTensor(x.grid, x.grid.jagged_like(out_data), x.kmap)
         return self.to_out(out)
 
     def _attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask=None):
@@ -514,12 +615,13 @@ class UNetModel(nn.Module):
 
         hs = []
         for block in self.encoder_blocks:
+
             data = block(data, emb, context=context, mask=mask)
             hs.append(data)
         data = self.middle_block(data, emb, context=context, mask=mask)
         for block in self.decoder_blocks:
             pop_data = hs.pop()
-            data = VDBTensor.cat([pop_data, data], dim=1)
+            data = fvdb.jcat([pop_data, data], dim=1)
             data = block(data, emb, hs[-1] if len(hs) > 0 else None, context=context, mask=mask)
 
         data = self.out_block(data)
