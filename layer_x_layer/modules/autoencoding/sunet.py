@@ -245,6 +245,24 @@ class StructPredictionNet(nn.Module):
         self.decoders = nn.ModuleList()
         self.struct_convs = nn.ModuleList()
         self.num_blocks = num_blocks
+        self.in_channels = in_channels
+        self.order = order
+        self.num_groups = num_groups
+        self.pooling = pooling
+        self.pooling_level = pooling_level
+        self.cut_ratio = cut_ratio
+        self.neck_bound = neck_bound
+        self.neck_dense_type = neck_dense_type
+        self.with_color_branch = with_color_branch
+        self.with_normal_branch = with_normal_branch
+        self.with_semantic_branch = with_semantic_branch
+        self.num_semantic_classes = num_semantic_classes
+        self.f_maps = f_maps
+        self.num_res_blocks = num_res_blocks
+        self.use_attention = use_attention
+        self.use_residual = use_residual
+        self.num_groups = num_groups
+        self.use_checkpoint = use_checkpoint
 
         self.unstable_cutoff = unstable_cutoff
         self.unstable_cutoff_threshold = unstable_cutoff_threshold
