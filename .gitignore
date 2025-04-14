@@ -9,3 +9,5 @@ layer_x_layer/data_gen/temp_vox/*
 layer_x_layer/data_gen/voxels/512/000-000/*
 data_generation/objaverse_images/*
 data_generation/objaverse_descriptions/*
+data_generation/.env
+data_generation/image_upload.log
