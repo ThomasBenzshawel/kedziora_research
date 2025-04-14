@@ -81,8 +81,8 @@ def image_data_augmentation(folder_path):
     folder_name = folder_path.split("/")[-1]
 
     #output file goes to objaverse_descriptions folder
-    os.makedirs("/home/benzshawelt/Research/objaverse_descriptions", exist_ok=True)
-    output_file = f"/home/benzshawelt/Research/objaverse_descriptions/{folder_name}.txt"
+    os.makedirs("./objaverse_descriptions", exist_ok=True)
+    output_file = f"./objaverse_descriptions/{folder_name}.txt"
     # Write output to file, if it already exists, overwrite it, if not create a new one
     with open(output_file, "w") as f:
         f.write(text_outputs[0])
@@ -105,7 +105,7 @@ if __name__ == "__main__":
     device_map = "cuda:0"
     llava_model_args = {
             "multimodal": True,
-            # "attn_implementation": None,
+            "attn_implementation": None,
         }
     overwrite_config = {}
     overwrite_config["image_aspect_ratio"] = "pad"
@@ -114,7 +114,7 @@ if __name__ == "__main__":
     model.eval()
     model.to(device)
 
-    target_folder = "/home/benzshawelt/Research/objaverse_images"
+    target_folder = "./objaverse_images"
 
     # Use tqdm to show progress bar
 
