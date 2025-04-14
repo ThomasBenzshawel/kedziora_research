@@ -7,3 +7,5 @@ layer_x_layer/data_gen/ply_files/*
 layer_x_layer/data_gen/glb_conversion.log
 layer_x_layer/data_gen/temp_vox/*
 layer_x_layer/data_gen/voxels/512/000-000/*
+data_generation/objaverse_images/*
+data_generation/objaverse_descriptions/*

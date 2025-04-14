@@ -159,15 +159,5 @@ def process_objaverse_files(json_path, output_dir):
 
 # Example usage
 json_path = "/home/benzshawelt/.objaverse/hf-objaverse-v1/object-paths.json"
-output_dir = "/home/benzshawelt/Research/objaverse_images"
+output_dir = "./objaverse_images"
 process_objaverse_files(json_path, output_dir)
-
-
-        
-# # Example usage
-# # glb_file = "/home/benzshawelt/.objaverse/hf-objaverse-v1/glbs/000-011/7a1dddb8703d4ea58a2b3f2ab1b5f2d9.glb"
-# # glb_file = "/home/benzshawelt/.objaverse/hf-objaverse-v1/glbs/000-038/a72cbed60b2b434e8da695fd389fde5b.glb"
-# # glb_file = "/home/benzshawelt/.objaverse/hf-objaverse-v1/glbs/000-049/a86575a96a2e4c63bfa4a0ade255f19c.glb"
-# glb_file = "/home/benzshawelt/.objaverse/hf-objaverse-v1/glbs/000-111/3f030f580d2c4cdf8096b4a3a63cecaf.glb"
-# output_prefix = "output_image_3"
-# render_glb(glb_file, output_prefix)
