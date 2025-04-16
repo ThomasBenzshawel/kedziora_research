@@ -1,4 +1,4 @@
-name: camera_dev_test
+name: camera_dev
 channels:
   - menpo
   - nvidia

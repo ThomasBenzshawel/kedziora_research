@@ -5,9 +5,8 @@ import time
 from tqdm import tqdm
 import logging
 from dotenv import load_dotenv
-import cloudinary
-import cloudinary.uploader
-import cloudinary.api
+import requests
+import mimetypes
 
 # Set up logging
 logging.basicConfig(
@@ -23,15 +22,11 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
-# Cloudinary Configuration
-cloudinary.config(
-    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME", ""),
-    api_key=os.getenv("CLOUDINARY_API_KEY", ""),
-    api_secret=os.getenv("CLOUDINARY_API_SECRET", "")
-)
+# Get API endpoint from environment variables
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:3000")
 
 def upload_images_for_object(object_id, image_paths, angles=None):
-    """Upload multiple images for a specific object to Cloudinary"""
+    """Upload multiple images for a specific object using the API endpoint"""
     
     if not angles:
         # If angles aren't specified, try to infer from filenames (e.g., "front_view.jpg" → "front")
@@ -51,23 +46,44 @@ def upload_images_for_object(object_id, image_paths, angles=None):
         angle = angles[i] if i < len(angles) else "unspecified"
         
         try:
-            # Upload to Cloudinary with object_id and angle as tags
-            upload_result = cloudinary.uploader.upload(
-                img_path,
-                folder=f"objects/{object_id}",
-                tags=[object_id, angle],
-                public_id=f"{angle}_{os.path.splitext(os.path.basename(img_path))[0]}"
-            )
+            # Prepare the API endpoint URL
+            upload_url = f"{API_BASE_URL}/api/objects/{object_id}/images"
             
-            # Store the upload result
-            results.append({
-                "public_id": upload_result.get("public_id"),
-                "url": upload_result.get("secure_url"),
-                "angle": angle,
-                "original_filename": os.path.basename(img_path)
-            })
+            # Determine the content type based on file extension
+            content_type, _ = mimetypes.guess_type(img_path)
+            if not content_type:
+                content_type = 'application/octet-stream'
             
-            logger.info(f"Uploaded {os.path.basename(img_path)} for object {object_id} with angle {angle}")
+            # Open the image file
+            with open(img_path, 'rb') as img_file:
+                # Create the form data with the file and angle
+                files = {'file': (os.path.basename(img_path), img_file, content_type)}
+                data = {'angle': angle}
+                
+                # Make the POST request to the API endpoint
+                response = requests.post(upload_url, files=files, data=data)
+                
+                # Check if the request was successful
+                if response.status_code == 200:
+                    # Parse the response JSON
+                    upload_result = response.json()
+                    
+                    # Store the result if successful
+                    if upload_result and upload_result.get('success', False):
+                        image_data = upload_result.get('data', {})
+                        
+                        results.append({
+                            "public_id": image_data.get('imageId'),
+                            "url": image_data.get('url'),
+                            "angle": angle,
+                            "original_filename": os.path.basename(img_path)
+                        })
+                        
+                        logger.info(f"Uploaded {os.path.basename(img_path)} for object {object_id} with angle {angle}")
+                    else:
+                        logger.error(f"API returned success=False for {os.path.basename(img_path)}: {upload_result}")
+                else:
+                    logger.error(f"API returned status code {response.status_code} for {os.path.basename(img_path)}: {response.text}")
             
         except Exception as e:
             logger.error(f"Error uploading {os.path.basename(img_path)} for object {object_id}: {str(e)}")
@@ -81,7 +97,7 @@ def upload_images_for_object(object_id, image_paths, angles=None):
 
 def batch_upload_from_directory(base_dir, delay=0.5):
     """
-    Upload images from a directory structure to Cloudinary.
+    Upload images from a directory structure to the API.
     Assumes the directory structure is:
     base_dir/
         object_id_1/
@@ -132,7 +148,7 @@ def batch_upload_from_directory(base_dir, delay=0.5):
     return results
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Batch upload images to Cloudinary")
+    parser = argparse.ArgumentParser(description="Batch upload images to API")
     parser.add_argument("--dir", required=True, help="Base directory containing object subdirectories")
     parser.add_argument("--delay", type=float, default=0.5, help="Delay between object uploads (seconds)")
     

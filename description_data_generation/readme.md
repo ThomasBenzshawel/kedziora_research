@@ -24,13 +24,16 @@ python -m pip install -e ".[train]"
 
 cd ../
 python interleved.py
+OR
+python COT_interleved.py
 
 add to a .env file in the same dir for your cloudinary service:
-CLOUDINARY_CLOUD_NAME=...
-CLOUDINARY_API_KEY=...
-CLOUDINARY_API_SECRET=...
+MONGO_URI=...
+DATABASE=...
+API_BASE_URL=...
 
 conda env create -f cloudinary.yaml
 conda activate cloudinary
-upload_to_cloudinary.py --dir objaverse_images
-upload_to_mongo.py --dir objaverse_descriptions
+python upload_to_mongo.py --dir objaverse_descriptions
+python upload_to_cloudinary.py --dir objaverse_images
+
