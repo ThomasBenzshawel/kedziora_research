@@ -145,13 +145,21 @@ def image_data_augmentation(folder_path):
     pair3_output = tokenizer.batch_decode(pair3_response, skip_special_tokens=True)[0]
     descriptions.append(pair3_output)
     
-    # Final comprehensive description using all previous observations
+    # Final comprehensive description using all previous observations AND all 6 images
     final_question = f"""Based on your complete analysis of the object from multiple angles, create a comprehensive and accurate description that captures its essential characteristics.
-
+    
     Your detailed observations:
     First pair of angles: {pair1_output}
     Second pair of angles: {pair2_output}
     Third pair of angles: {pair3_output}
+
+    Now you can see all six angles of the object at once:
+    {DEFAULT_IMAGE_TOKEN}
+    {DEFAULT_IMAGE_TOKEN}
+    {DEFAULT_IMAGE_TOKEN}
+    {DEFAULT_IMAGE_TOKEN}
+    {DEFAULT_IMAGE_TOKEN}
+    {DEFAULT_IMAGE_TOKEN}
     
     Here's an example of an excellent final description for a vintage pocket watch:
     
@@ -189,15 +197,109 @@ def image_data_augmentation(folder_path):
     prompt_question = conv.get_prompt()
     
     input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
+    image_sizes = [img.size for img in images]  # Get sizes for all 6 images
     
-    # Generate final comprehensive response without images (using only text)
+    # Generate final comprehensive response WITH all 6 images
     final_response = model.generate(
         input_ids,
+        images=all_image_tensors,  # Use all images
+        image_sizes=image_sizes,   # Use all image sizes
         do_sample=False,
         temperature=0,
         max_new_tokens=2048,
     )
     final_output = tokenizer.batch_decode(final_response, skip_special_tokens=True)[0]
+    
+    # Post-process the description to make it suitable for voxel generation
+    voxel_question = f"""You are helping prepare descriptions for generating 3D voxel models. I have a detailed object description that needs to be modified to make it more suitable for voxel-based generation.
+
+    Original description:
+    {final_output}
+
+    Please modify this description to make it better suited for generating fine-grain voxel models by:
+
+    1. Removing all specific size information (measurements, dimensions, etc.)
+    2. Removing detailed texture information (roughness, smoothness, patina, etc.)
+    3. Removing material properties like weight, density, glossiness, or reflectivity
+    4. Focusing on:
+       - Basic geometric shape and form
+       - Component relationships and structure
+       - Core color information 
+       - High-level visual details and patterns
+       - Overall proportions (but not specific measurements)
+       - Construction and connection between parts
+
+    Please maintain the original three-part format (Label, Short Description, Long Description) but optimize it for voxel model generation. The result should be clean, precise, and focus on information that's useful for constructing a blocky, voxel-based representation of the object.
+    """
+    
+    conv = copy.deepcopy(conv_templates[conv_template])
+    conv.append_message(conv.roles[0], voxel_question)
+    conv.append_message(conv.roles[1], None)
+    prompt_question = conv.get_prompt()
+    
+    input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
+    
+    # Generate voxel-optimized description (without images, just processing the text)
+    voxel_response = model.generate(
+        input_ids,
+        do_sample=False,
+        temperature=0,
+        max_new_tokens=2048,
+    )
+    voxel_output = tokenizer.batch_decode(voxel_response, skip_special_tokens=True)[0]
+    
+    # Confidence evaluation step
+    confidence_question = f"""You are analyzing the quality of an object description for voxel modeling. Review this voxel-optimized description along with the original set of images and rate your confidence in the description's accuracy on a scale of 1 to 10.
+
+    Voxel-optimized description:
+    {voxel_output}
+
+    Review all angles of the object again:
+    {DEFAULT_IMAGE_TOKEN}
+    {DEFAULT_IMAGE_TOKEN}
+    {DEFAULT_IMAGE_TOKEN}
+    {DEFAULT_IMAGE_TOKEN}
+    {DEFAULT_IMAGE_TOKEN}
+    {DEFAULT_IMAGE_TOKEN}
+
+    Rate your confidence on a scale of 1 to 10, where:
+    1 = The description misses major elements of the object or is fundamentally wrong
+    5 = The description captures the main elements but has some inaccuracies
+    10 = The description perfectly captures all important elements for voxel generation
+
+    Consider:
+    - Does the description correctly identify the object?
+    - Are all key components of the object included?
+    - Is the spatial relationship between components accurately described?
+    - Are the colors and patterns correctly represented?
+    - Would a voxel artist be able to accurately recreate this object from the description?
+
+    Provide your confidence rating as:
+    "Confidence Rating: [X/10]" 
+    where X is your rating from 1 to 10.
+    """
+    
+    conv = copy.deepcopy(conv_templates[conv_template])
+    conv.append_message(conv.roles[0], confidence_question)
+    conv.append_message(conv.roles[1], None)
+    prompt_question = conv.get_prompt()
+    
+    input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
+    image_sizes = [img.size for img in images]  # Get sizes for all 6 images
+    
+    # Generate confidence evaluation WITH all 6 images
+    confidence_response = model.generate(
+        input_ids,
+        images=all_image_tensors,  # Use all images again
+        image_sizes=image_sizes,   # Use all image sizes
+        do_sample=False,
+        temperature=0,
+        max_new_tokens=1024,
+    )
+    confidence_output = tokenizer.batch_decode(confidence_response, skip_special_tokens=True)[0]
+    
+    # Combine the voxel-optimized description with the confidence rating
+    final_output = voxel_output + "\n\n" + confidence_output
     
     # Save output to txt file
     folder_name = folder_path.split("/")[-1]

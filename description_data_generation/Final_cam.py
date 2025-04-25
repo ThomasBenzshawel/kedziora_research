@@ -12,7 +12,6 @@ import cv2
 def get_camera_poses(scene):
     centroid = scene.centroid
     bounds = scene.bounds
-    #todo
     diagonal = np.linalg.norm(bounds[1] - bounds[0])
     
     # Define camera positions relative to the centroid
@@ -21,8 +20,8 @@ def get_camera_poses(scene):
         [0, 0, -diagonal],  # Back
         [diagonal, 0, 0],  # Right
         [-diagonal, 0, 0],  # Left
-        [0, diagonal, 0.1*diagonal],  # Up (slightly offset)
-        [0, -diagonal, 0.1*diagonal],  # Down (slightly offset)
+        [0, diagonal, 0.075*diagonal],  # Up (slightly offset)
+        [0, -diagonal, 0.075*diagonal],  # Down (slightly offset)
     ]
     
     camera_poses = []
@@ -55,13 +54,15 @@ def render_glb(glb_path, output_prefix, resolution=(800, 600)):
 
     pyrender_scene = pyrender.Scene.from_trimesh_scene(scene)
 
+    pyrender_scene.ambient_light = [.03, .03, .03]
+
     camera_poses, scene_diagonal = get_camera_poses(scene)
     fov = 2 * np.arctan(scene_diagonal / (2 * scene_diagonal))
     camera = pyrender.PerspectiveCamera(yfov=fov)
 
 
     for pos in camera_poses:
-        light = pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=2.75)
+        light = pyrender.DirectionalLight(color=[0.2, 0.2, 0.2], intensity=1.75)
         pyrender_scene.add(light, pose=pos)
 
 
@@ -79,6 +80,7 @@ def render_glb(glb_path, output_prefix, resolution=(800, 600)):
                                    outerConeAngle=np.pi/6.0)
         light_node = pyrender_scene.add(light, pose=pose)
 
+
         for iteration in range(10):
             color, _ = r.render(pyrender_scene)
             
@@ -87,11 +89,11 @@ def render_glb(glb_path, output_prefix, resolution=(800, 600)):
             
             if iteration < 9:
                 # Increase light intensity and try again
-                light_intensity *= 5
+                light_intensity *= 1.5
                 pyrender_scene.remove_node(light_node)
                 light = pyrender.SpotLight(color=np.ones(3), intensity=light_intensity,
-                                           innerConeAngle=np.pi/16.0,
-                                           outerConeAngle=np.pi/6.0)
+                                           innerConeAngle=np.pi/8.0,
+                                           outerConeAngle=np.pi/4.0)
                 light_node = pyrender_scene.add(light, pose=pose)
             else:
                 # If we've reached 10 iterations, use the original (black and white) image
@@ -105,18 +107,40 @@ def render_glb(glb_path, output_prefix, resolution=(800, 600)):
         pyrender_scene.remove_node(camera_node)
         pyrender_scene.remove_node(light_node)
 
-def is_black_and_white(image, color_threshold=10):
+def is_black_and_white(image, color_threshold=10, saturation_threshold=20, value_range_threshold=30):
     # Convert to HSV for better color analysis
     hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
     
-    # Check the standard deviation of the Hue channel
+    # Check the standard deviation and mean of the Hue channel
     hue_std = np.std(hsv[:,:,0])
+    
+    # Analyze saturation channel - crucial for detecting colorfulness
+    sat_mean = np.mean(hsv[:,:,1])
+    sat_std = np.std(hsv[:,:,1])
+    
+    # Analyze value (brightness) channel to distinguish grayscale from white/black
+    val_mean = np.mean(hsv[:,:,2])
+    val_range = np.max(hsv[:,:,2]) - np.min(hsv[:,:,2])
+    
+    # Calculate histogram of hue and look for peaks
+    hist_hue = cv2.calcHist([hsv], [0], None, [36], [0, 180])
+    hist_hue = hist_hue / np.sum(hist_hue)  # Normalize
+    hue_peaks = np.sum(hist_hue > 0.05)  # Count significant hue peaks
     
     # Check the number of unique colors
     unique_colors = np.unique(image.reshape(-1, 3), axis=0)
     
-    # Consider it color if there's significant hue variation or many unique colors
-    return hue_std < 5 and len(unique_colors) <= color_threshold
+    # Comprehensive assessment of whether the image is black and white
+    is_bw = (
+        (hue_std < 5) and                    # Low hue variation
+        (sat_mean < saturation_threshold) and # Low overall saturation
+        (sat_std < saturation_threshold/2) and # Low saturation variation
+        (hue_peaks <= 2) and                  # Few dominant hues
+        (len(unique_colors) <= color_threshold or 
+         (val_range < value_range_threshold and sat_mean < 10))  # Few colors or low dynamic range with low saturation
+    )
+    
+    return is_bw
 
 
 
