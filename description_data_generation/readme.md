@@ -25,7 +25,7 @@ python -m pip install -e ".[train]"
 cd ../
 python interleved.py
 OR
-python COT_interleved.py
+python COT_interleaved.py
 
 add to a .env file in the same dir for your cloudinary service:
 MONGO_URI=...
