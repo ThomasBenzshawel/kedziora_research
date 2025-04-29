@@ -221,17 +221,28 @@ def image_data_augmentation(folder_path):
     1. Removing all specific size information (measurements, dimensions, etc.)
     2. Removing detailed texture information (roughness, smoothness, patina, etc.)
     3. Removing material properties like weight, density, glossiness, or reflectivity
+    4. Removing any references to the object's function or purpose
+    5. Removing any references to the object's environment or context
+    6. Removing any references to the scene's lighting or shadows
     4. Focusing on:
-       - Basic geometric shape and form
-       - Component relationships and structure
-       - Core color information 
-       - High-level visual details and patterns
-       - Overall proportions (but not specific measurements)
-       - Construction and connection between parts
+    - Basic geometric shape and form
+    - Component relationships and structure
+    - Core color information 
+    - High-level visual details and patterns
+    - Overall proportions (but not specific measurements)
+    - Construction and connection between parts
 
-    Please maintain the original three-part format (Label, Short Description, Long Description) but optimize it for voxel model generation. The result should be clean, precise, and focus on information that's useful for constructing a blocky, voxel-based representation of the object.
-    """
-    
+    IMPORTANT: Format your response with exactly TWO line breaks (\\n\\n) after the Label line. This is critical for proper parsing.
+
+    For example:
+    Label: Vintage Alarm Clock
+
+    Short Description: A classic analog alarm clock with a bell on top.
+
+    Long Description: [rest of description...]
+
+    Please maintain the three-part format but optimize it for voxel model generation. The result should be clean, precise, and focus on information that's useful for constructing a blocky, voxel-based representation of the object.
+    """    
     conv = copy.deepcopy(conv_templates[conv_template])
     conv.append_message(conv.roles[0], voxel_question)
     conv.append_message(conv.roles[1], None)
@@ -314,6 +325,11 @@ def image_data_augmentation(folder_path):
 if __name__ == "__main__":
     warnings.filterwarnings("ignore")
 
+    #before we start this process, lets remove all of the image folders that do not have 6 images in them
+    # Check if the folder exists
+
+    target_folder = "./objaverse_images"
+
     # Clear CUDA cache
     torch.cuda.empty_cache()
 
@@ -335,12 +351,12 @@ if __name__ == "__main__":
     model.eval()
     model.to(device)
 
-    target_folder = "./objaverse_images"
 
     # Use tqdm to show progress bar
     for folder in tqdm.tqdm(os.listdir(target_folder)):
         folder_path = os.path.join(target_folder, folder)
-        # if the folder is empty, skip it
-        if not os.listdir(folder_path):
+        # if the folder does not have 6 images in it, skip it
+        if len(os.listdir(folder_path)) != 6:
+            print(f"Skipping folder with {len(os.listdir(folder_path))} images: {folder_path}")
             continue
         image_data_augmentation(folder_path)
