@@ -7,7 +7,12 @@ import pyrender
 import numpy as np
 from PIL import Image
 import cv2
+import json
+import os
+from tqdm import tqdm  # For progress bar
+import time
 
+VERIFICATION = "./check_objaverse_images/"
 
 def get_camera_poses(scene):
     centroid = scene.centroid
@@ -52,84 +57,101 @@ def look_at(eye, target):
 def render_glb(glb_path, output_prefix, resolution=(800, 600)):
     scene = trimesh.load(glb_path)
 
-    pyrender_scene = pyrender.Scene.from_trimesh_scene(scene)
-
-    pyrender_scene.ambient_light = [.03, .03, .03]
-
+    pyrender_scene = pyrender.Scene.from_trimesh_scene(scene, bg_color=[0.5, 0.5, 0.5], ambient_light = [1, 1, 1])
+    
     camera_poses, scene_diagonal = get_camera_poses(scene)
     fov = 2 * np.arctan(scene_diagonal / (2 * scene_diagonal))
     camera = pyrender.PerspectiveCamera(yfov=fov)
 
-
     for pos in camera_poses:
-        light = pyrender.DirectionalLight(color=[0.2, 0.2, 0.2], intensity=1.75)
+        light = pyrender.DirectionalLight(color=[0.6, 0.6, 0.6], intensity=2)
         pyrender_scene.add(light, pose=pos)
-
-
-    r = pyrender.OffscreenRenderer(viewport_width=resolution[0],
-                                viewport_height=resolution[1])
 
     perspectives = ['front', 'back', 'right', 'left', 'up', 'down']
     for i, pose in enumerate(camera_poses):
-        camera_node = pyrender_scene.add(camera, pose=pose)
-        
-        # Initialize light with low intensity
-        light_intensity = 1.5
+        light_intensity = 1.75  # Initial light intensity
         light = pyrender.SpotLight(color=np.ones(3), intensity=light_intensity,
-                                   innerConeAngle=np.pi/16.0,
-                                   outerConeAngle=np.pi/6.0)
+                                            innerConeAngle=np.pi/8.0,
+                                            outerConeAngle=np.pi/4.0)
         light_node = pyrender_scene.add(light, pose=pose)
 
 
         for iteration in range(10):
+
+            camera_node = pyrender_scene.add(camera, pose=pose)
+            r = pyrender.OffscreenRenderer(viewport_width=resolution[0],
+        viewport_height=resolution[1], point_size=1.0)
+
             color, _ = r.render(pyrender_scene)
+            r = None  # Release the renderer
+            is_bw = is_black_and_white(color)
+
+            pyrender_scene.remove_node(camera_node)
+
             
-            if not is_black_and_white(color):
+            if is_bw == "color":
+                # Save the image if it's not black and white
                 break
             
             if iteration < 9:
-                # Increase light intensity and try again
-                light_intensity *= 1.5
-                pyrender_scene.remove_node(light_node)
-                light = pyrender.SpotLight(color=np.ones(3), intensity=light_intensity,
-                                           innerConeAngle=np.pi/8.0,
-                                           outerConeAngle=np.pi/4.0)
-                light_node = pyrender_scene.add(light, pose=pose)
+                if is_bw == "black":
+                    print(f"Image is black, increasing light intensity for {perspectives[i]} view.")
+                    # Increase light intensity and try again
+                    light_intensity *= 1.75
+                    pyrender_scene.remove_node(light_node)
+                    light = pyrender.SpotLight(color=np.ones(3), intensity=light_intensity,
+                                            innerConeAngle=np.pi/8.0,
+                                            outerConeAngle=np.pi/4.0)
+                    light_node = pyrender_scene.add(light, pose=pose)
+                elif is_bw == "white":
+                    print(f"Image is white, decreasing light intensity for {perspectives[i]} view.")
+                    # Decrease light intensity and try again
+                    light_intensity *= 0.5
+                    pyrender_scene.remove_node(light_node)
+                    light = pyrender.SpotLight(color=np.ones(3), intensity=light_intensity,
+                                            innerConeAngle=np.pi/8.0,
+                                            outerConeAngle=np.pi/4.0)
+                    light_node = pyrender_scene.add(light, pose=pose)
             else:
                 # If we've reached 10 iterations, use the original (black and white) image
                 print(f"Warning: {perspectives[i]} view remained black and white after 10 iterations.")
+                img = Image.fromarray(color)
+                output_path = f"{VERIFICATION}{os.path.basename(glb_path).split('.')[0]}_{perspectives[i]}.jpg"
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                # get the name of the object
+                # Save the image with the object name
+                img.save(output_path, 'JPEG', quality=95)  # Specify JPEG format and quality
 
         img = Image.fromarray(color)
-        output_path = f"{output_prefix}_{perspectives[i]}.jpg"  # Changed file extension to .jpg
+        output_path = f"{output_prefix}_{perspectives[i]}.jpg"  #
         img.save(output_path, 'JPEG', quality=95)  # Specify JPEG format and quality
         # print(f"Image saved to {output_path}")
 
-        pyrender_scene.remove_node(camera_node)
         pyrender_scene.remove_node(light_node)
 
 def is_black_and_white(image, color_threshold=10, saturation_threshold=20, value_range_threshold=30):
     # Convert to HSV for better color analysis
     hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-    
+
     # Check the standard deviation and mean of the Hue channel
     hue_std = np.std(hsv[:,:,0])
-    
+
     # Analyze saturation channel - crucial for detecting colorfulness
     sat_mean = np.mean(hsv[:,:,1])
     sat_std = np.std(hsv[:,:,1])
-    
+
     # Analyze value (brightness) channel to distinguish grayscale from white/black
     val_mean = np.mean(hsv[:,:,2])
     val_range = np.max(hsv[:,:,2]) - np.min(hsv[:,:,2])
-    
+
     # Calculate histogram of hue and look for peaks
     hist_hue = cv2.calcHist([hsv], [0], None, [36], [0, 180])
     hist_hue = hist_hue / np.sum(hist_hue)  # Normalize
     hue_peaks = np.sum(hist_hue > 0.05)  # Count significant hue peaks
-    
+
     # Check the number of unique colors
     unique_colors = np.unique(image.reshape(-1, 3), axis=0)
-    
+
     # Comprehensive assessment of whether the image is black and white
     is_bw = (
         (hue_std < 5) and                    # Low hue variation
@@ -139,17 +161,15 @@ def is_black_and_white(image, color_threshold=10, saturation_threshold=20, value
         (len(unique_colors) <= color_threshold or 
          (val_range < value_range_threshold and sat_mean < 10))  # Few colors or low dynamic range with low saturation
     )
-    
-    return is_bw
 
-
-
-
-# Process all files in the Objaverse dataset
-import json
-import os
-from tqdm import tqdm  # For progress bar
-
+    if is_bw:
+        # Check if it's predominantly dark or light
+        if val_mean < 50:
+            return "black"
+        else:
+            return "white"
+    else:
+        return "color"
 
 def process_objaverse_files(json_path, output_dir):
     # Read and parse the gzipped JSON file

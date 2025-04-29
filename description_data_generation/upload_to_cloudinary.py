@@ -124,12 +124,12 @@ def batch_upload_from_directory(base_dir, delay=0.5):
         
         # Find all images in this directory
         image_files = []
-        for ext in ['jpg', 'jpeg', 'png', 'gif']:
+        for ext in ['jpg', 'jpeg']:
             image_files.extend(glob(os.path.join(object_path, f"*.{ext}")))
             image_files.extend(glob(os.path.join(object_path, f"*.{ext.upper()}")))
         
-        if not image_files:
-            logger.warning(f"No images found for object {object_id}, skipping")
+        if len(image_files) < 6:
+            logger.warning(f"Not enough images found for object {object_id}, skipping")
             results["skipped"] += 1
             continue
         
