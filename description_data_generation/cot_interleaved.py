@@ -15,6 +15,11 @@ import objaverse
 
 
 def image_data_augmentation(folder_path):
+    folder_name = folder_path.split("/")[-1]
+    output_file = f"./objaverse_descriptions/{folder_name}.txt"
+    if os.path.exists(output_file):
+        print(f"Output file already exists: {output_file}")
+        return
     # Image paths for local files
     image_paths = []
     for image in os.listdir(folder_path):
@@ -46,8 +51,8 @@ def image_data_augmentation(folder_path):
     # First pair of images with one-shot example
     pair1_question = f"""You are an expert object analyst with exceptional attention to detail. I'll show you multiple images of a {object_name} from different angles.
 
-    {DEFAULT_IMAGE_TOKEN} This is the first image of the {object_name}. 
-    {DEFAULT_IMAGE_TOKEN} This is the second image of the same {object_name} from a different angle.
+    {DEFAULT_IMAGE_TOKEN} This is the first image of the object. 
+    {DEFAULT_IMAGE_TOKEN} This is the second image of the same object from a different angle.
     
     Analyze these two images and describe only the physical object shown, completely ignoring backgrounds or supporting surfaces. I need precise details about shape, materials, colors, textures, and construction.
     
@@ -55,7 +60,7 @@ def image_data_augmentation(folder_path):
     
     "This object is a ceramic coffee mug with a cylindrical body and a C-shaped handle attached to one side. The mug has a glossy white exterior with a blue geometric pattern consisting of interlocking triangles that form a band around the upper portion. From the second angle, I can see the interior is solid blue with the same glossy finish as the exterior. The mug has straight sides with a slight taper toward the base, and a flat bottom with an unglazed ring where it sits on surfaces. The rim is smooth and rounded, approximately 3.5 inches in diameter, while the handle has enough clearance for an adult's fingers. The construction appears sturdy, with the handle securely attached to the body at both the upper and lower connection points."
     
-    Please provide a similarly detailed analysis for the {object_name} in these images. Focus exclusively on the physical characteristics of the object itself.
+    Please provide a similarly detailed analysis for the object in these images. Focus exclusively on the physical characteristics of the object itself.
     """
     
     conv = copy.deepcopy(conv_templates[conv_template])
@@ -79,12 +84,12 @@ def image_data_augmentation(folder_path):
     descriptions.append(pair1_output)
     
     # Second pair of images with context from first pair
-    pair2_question = f"""Continuing your analysis of the same {object_name}.
+    pair2_question = f"""You are an expert object analyst with exceptional attention to detail. You are continuing your analysis of the same {object_name}.
     
     Your observations so far: 
     {pair1_output}
     
-    Now examining two more angles of the same {object_name}:
+    Now examining two more angles of the same object:
     {DEFAULT_IMAGE_TOKEN} 
     {DEFAULT_IMAGE_TOKEN}
     
@@ -92,7 +97,7 @@ def image_data_augmentation(folder_path):
     
     "From these new angles, I can now see additional important features that weren't visible before. The keyboard has a standard QWERTY layout with 104 keys including a numeric keypad on the right side. The keycaps are made of double-shot PBT plastic with a textured matte finish, and the legends are shine-through to accommodate the RGB lighting that's visible between the keys. The top plate is aluminum with a brushed finish, while the bottom case is made of textured black plastic with rubber feet at the corners. From this angle, I can see the USB-C port located at the center of the back edge, flanked by cable routing channels. There are two adjustable height feet at the rear that can be flipped up to change the typing angle."
     
-    Using these new perspectives, identify features, details, or aspects of the {object_name} that weren't visible in the first two images. Build upon your previous description without repeating information you've already covered.
+    Using these new perspectives, identify features, details, or aspects of the object that weren't visible in the first two images. Build upon your previous description without repeating information you've already covered.
     """
     
     conv = copy.deepcopy(conv_templates[conv_template])
@@ -116,14 +121,14 @@ def image_data_augmentation(folder_path):
     descriptions.append(pair2_output)
     
     # Third pair of images with context from previous descriptions
-    pair3_question = f"""Complete your analysis of the {object_name} with these final two perspectives.
+    pair3_question = f"""You are an expert object analyst with exceptional attention to detail. You are completing your analysis of the {object_name} with these final two perspectives.
     
     Your observations so far:
     First pair of angles: {pair1_output}
     
     Second pair of angles: {pair2_output}
     
-    Now examining the final two angles of the {object_name}:
+    Now examining the final two angles of the object:
     {DEFAULT_IMAGE_TOKEN} 
     {DEFAULT_IMAGE_TOKEN}
     
@@ -131,7 +136,7 @@ def image_data_augmentation(folder_path):
     
     "These final angles reveal crucial details about the vase's construction and ornamentation. The mouth of the vase has a delicate gold leaf rim that wasn't visible in previous views, and I can now confirm that the interior is glazed in a solid midnight blue that contrasts with the exterior patterns. The base has a maker's mark etched into the bottom - a small stylized flower symbol followed by what appears to be a studio signature. There's also a small unglazed ring on the bottom where the vase sits on surfaces. From these angles, I can see that the floral pattern wraps completely around the vase with no breaks in continuity, suggesting careful attention to the design. Additionally, there are three thin gold bands circling the vase: one at the rim, one at the shoulder, and one just above the base, which adds to its elegant appearance."
     
-    Focus on revealing any final details that weren't visible from previous angles, and confirm or clarify any uncertain aspects of shape, color, texture, or material. Continue to ignore backgrounds and focus only on the {object_name} itself.
+    Focus on revealing any final details that weren't visible from previous angles, and confirm or clarify any uncertain aspects of shape, color, texture, or material. Continue to ignore backgrounds and focus only on the object itself.
     """
     
     conv = copy.deepcopy(conv_templates[conv_template])
@@ -155,14 +160,14 @@ def image_data_augmentation(folder_path):
     descriptions.append(pair3_output)
     
     # Final comprehensive description using all previous observations AND all 6 images
-    final_question = f"""Based on your complete analysis of the {object_name} from multiple angles, create a comprehensive and accurate description that captures its essential characteristics.
+    final_question = f"""You are an expert object analyst with exceptional attention to detail. Based on your previous analysis of the {object_name} from multiple angles, create a comprehensive and accurate description that captures its essential characteristics.
     
-    Your detailed observations:
+    Your detailed observations from observations so far:
     First pair of angles: {pair1_output}
     Second pair of angles: {pair2_output}
     Third pair of angles: {pair3_output}
 
-    Now you can see all six angles of the {object_name} at once:
+    Now you can see all six angles of the  object at once:
     {DEFAULT_IMAGE_TOKEN}
     {DEFAULT_IMAGE_TOKEN}
     {DEFAULT_IMAGE_TOKEN}
@@ -179,7 +184,7 @@ def image_data_augmentation(folder_path):
     
     Please synthesize your observations into a similar three-part description with:
     
-    1. Label: {object_name} (you may refine or change this if you have a more precise name)
+    1. Label: {object_name} (you may refine or change this if you have a more accurate or less ambiguous name)
     2. Short Description: A concise one-sentence description capturing the object's essence
     3. Long Description: A detailed description covering all physical aspects including:
        - Overall shape, form, and dimensions
@@ -195,7 +200,7 @@ def image_data_augmentation(folder_path):
     - Do NOT refer to images, photos, angles, or views
     - Avoid phrases like "appears to be" or "seems to be" - be definitive
     - Do NOT mention that this is a 3D object or model, since this might be a real object
-    - Describe the {object_name} as if it physically exists in the real world right in front of you
+    - Describe the object as if it physically exists in the real world right in front of you
     """
     
     conv = copy.deepcopy(conv_templates[conv_template])
@@ -218,37 +223,42 @@ def image_data_augmentation(folder_path):
     final_output = tokenizer.batch_decode(final_response, skip_special_tokens=True)[0]
     
     # Post-process the description to make it suitable for voxel generation
-    voxel_question = f"""You are helping prepare descriptions for generating 3D voxel models. I have a detailed {object_name} description that needs to be modified to make it more suitable for voxel-based generation.
+    voxel_question = f"""You are an expert synthesizer for generating 3D voxel model descriptions. 
 
-    Original description:
+    I have a detailed object description that needs to be modified to make it more suitable for voxel-based generation.
+
+    Description for you to refine:
+    Label: {object_name}
     {final_output}
 
     Please modify this description to make it better suited for generating fine-grain voxel models by:
 
     1. Removing all specific size information (measurements, dimensions, etc.)
-    2. Removing detailed texture information (roughness, smoothness, patina, etc.)
+    2. Removing detailed texture information (roughness, smoothness, etc.)
     3. Removing material properties like weight, density, glossiness, or reflectivity
-    4. Removing any references to the {object_name}'s function or purpose
-    5. Removing any references to the {object_name}'s environment or context
-    6. Removing any references to the scene's lighting or shadows
-    4. Focusing on:
+    4. Removing any references to the object's environment or context
+    5. Removing any references to the scene's lighting or shadows
+    6. Focusing on:
     - Basic geometric shape and form
     - Component relationships and structure
-    - Core color information 
     - High-level visual details and patterns
+    - Distinctive features or design elements and their purpose
     - Overall proportions (but not specific measurements)
     - Construction and connection between parts
 
+    Please maintain the three-part format but optimize it for voxel model generation. The result should be clean, precise, and focus on information that could describe the object in a voxelized form.
+    If it is already a good voxel description, please output it as is, but it must still be in the three-part format and have the two line breaks after the Label line.
+    You must always output the description in the three-part format, even if it is already a good voxel description, never include your reasoning or thought process in the output.
+
     IMPORTANT: Format your response with exactly TWO line breaks (\\n\\n) after the Label line. This is critical for proper parsing.
 
-    For example:
+    
+    An example of the perfect output could be:
     Label: Vintage Alarm Clock
 
     Short Description: A classic analog alarm clock with a bell on top.
 
-    Long Description: [rest of description...]
-
-    Please maintain the three-part format but optimize it for voxel model generation. The result should be clean, precise, and focus on information that's useful for constructing a blocky, voxel-based representation of the {object_name}.
+    Long Description: The clock has round clock face. The clock has three hands indicating the time in hour and minutes, with a thin second hand, all in different sizes. The clock face is encased in a frame. There is a bell on top with a simple clapper inside. The base is designed to provide stability and is connected to the frame. The clock has a winding knob on the back for setting the time.
     """    
     conv = copy.deepcopy(conv_templates[conv_template])
     conv.append_message(conv.roles[0], voxel_question)
@@ -267,12 +277,14 @@ def image_data_augmentation(folder_path):
     voxel_output = tokenizer.batch_decode(voxel_response, skip_special_tokens=True)[0]
     
     # Confidence evaluation step
-    confidence_question = f"""You are analyzing the quality of a {object_name} description for voxel modeling. Review this voxel-optimized description along with the original set of images and rate your confidence in the description's accuracy on a scale of 1 to 10.
+    confidence_question = f""" You are an expert 3D model description evaluator.
+    
+    You are analyzing the quality of an object description for voxel modeling. Review this voxel-optimized description along with the original set of images and rate your confidence in the description's accuracy on a scale of 1 to 10.
 
     Voxel-optimized description:
     {voxel_output}
 
-    Review all angles of the {object_name} again:
+    Review all angles of the object again:
     {DEFAULT_IMAGE_TOKEN}
     {DEFAULT_IMAGE_TOKEN}
     {DEFAULT_IMAGE_TOKEN}
@@ -281,20 +293,19 @@ def image_data_augmentation(folder_path):
     {DEFAULT_IMAGE_TOKEN}
 
     Rate your confidence on a scale of 1 to 10, where:
-    1 = The description misses major elements of the {object_name} or is fundamentally wrong
+    1 = The description misses major elements of the object or is fundamentally wrong
     5 = The description captures the main elements but has some inaccuracies
-    10 = The description perfectly captures all important elements for voxel generation
+    10 = The description perfectly captures all important elements for generating a voxel version of the object
 
     Consider:
-    - Does the description correctly identify the {object_name}?
-    - Are all key components of the {object_name} included?
+    - Does the description correctly identify the object's shape and form?
+    - Are all key components of the object included?
     - Is the spatial relationship between components accurately described?
-    - Are the colors and patterns correctly represented?
-    - Would a voxel artist be able to accurately recreate this {object_name} from the description?
+    - Would a voxel artist be able to accurately recreate this object from the description?
 
     Provide your confidence rating as:
     "Confidence Rating: [X/10]" 
-    where X is your rating from 1 to 10.
+    where X is your rating from 1 to 10 and nothing else.
     """
     
     conv = copy.deepcopy(conv_templates[conv_template])
@@ -308,8 +319,8 @@ def image_data_augmentation(folder_path):
     # Generate confidence evaluation WITH all 6 images
     confidence_response = model.generate(
         input_ids,
-        images=all_image_tensors,  # Use all images again
-        image_sizes=image_sizes,   # Use all image sizes
+        images=all_image_tensors,  
+        image_sizes=image_sizes,  
         do_sample=False,
         temperature=0,
         max_new_tokens=1024,
@@ -320,9 +331,7 @@ def image_data_augmentation(folder_path):
     final_output = voxel_output + "\n\n" + confidence_output
     
     # Save output to txt file
-    folder_name = folder_path.split("/")[-1]
     os.makedirs("./objaverse_descriptions", exist_ok=True)
-    output_file = f"./objaverse_descriptions/{folder_name}.txt"
     
     with open(output_file, "w") as f:
         f.write(final_output)

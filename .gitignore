@@ -14,3 +14,4 @@ description_data_generation/image_upload.log
 description_data_generation/LLaVA-NeXT/*
 description_data_generation/check_objaverse_images/*
 description_data_generation/objaverse_xl/*
+description_data_generation/evaluator_assignments.py
