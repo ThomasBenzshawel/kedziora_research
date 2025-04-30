@@ -57,7 +57,7 @@ def look_at(eye, target):
 def render_glb(glb_path, output_prefix, resolution=(800, 600)):
     scene = trimesh.load(glb_path)
 
-    pyrender_scene = pyrender.Scene.from_trimesh_scene(scene, bg_color=[0.5, 0.5, 0.5], ambient_light = [1, 1, 1])
+    pyrender_scene = pyrender.Scene.from_trimesh_scene(scene, bg_color=[0.6, 0.6, 0.6], ambient_light = [1, 1, 1])
     
     camera_poses, scene_diagonal = get_camera_poses(scene)
     fov = 2 * np.arctan(scene_diagonal / (2 * scene_diagonal))
@@ -69,7 +69,7 @@ def render_glb(glb_path, output_prefix, resolution=(800, 600)):
 
     perspectives = ['front', 'back', 'right', 'left', 'up', 'down']
     for i, pose in enumerate(camera_poses):
-        light_intensity = 1.75  # Initial light intensity
+        light_intensity = 2  # Initial light intensity
         light = pyrender.SpotLight(color=np.ones(3), intensity=light_intensity,
                                             innerConeAngle=np.pi/8.0,
                                             outerConeAngle=np.pi/4.0)
@@ -83,7 +83,7 @@ def render_glb(glb_path, output_prefix, resolution=(800, 600)):
         viewport_height=resolution[1], point_size=1.0)
 
             color, _ = r.render(pyrender_scene)
-            r = None  # Release the renderer
+            r.delete()
             is_bw = is_black_and_white(color)
 
             pyrender_scene.remove_node(camera_node)
@@ -186,11 +186,15 @@ def process_objaverse_files(json_path, output_dir):
         
         # Check if the file exists
         if not os.path.exists(glb_file):
-            # print(f"File not found: {glb_file}")
+            # print(f"Object not found: {glb_file}")
             continue
 
-        #make a directory for each object
-        os.makedirs(os.path.join(output_dir, uid), exist_ok=True)
+        #make a directory for each object if the directory does not exist, if it does, skip that object
+        if os.path.exists(os.path.join(output_dir, uid)):
+            print(f"Directory already exists for {uid}, skipping.")
+            continue
+        else:
+            os.makedirs(os.path.join(output_dir, uid), exist_ok=True)
         
         # Create an output prefix for this object 
         output_prefix = os.path.join(output_dir, uid, uid)

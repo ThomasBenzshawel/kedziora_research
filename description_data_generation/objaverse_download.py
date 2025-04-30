@@ -8,7 +8,7 @@ import objaverse.xl as oxl
 
 
 def download_objaverse(xl = False):
-    random.seed(32)
+    # random.seed(32)
 
     if xl:
         annotations = oxl.get_annotations()
@@ -38,7 +38,7 @@ def download_objaverse(xl = False):
         uids = objaverse.load_uids()
 
 
-        random_object_uids = random.sample(uids, 10000)
+        random_object_uids = random.sample(uids, 100000)
 
 
         # Load metadata for these objects
