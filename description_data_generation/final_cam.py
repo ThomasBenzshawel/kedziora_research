@@ -201,7 +201,6 @@ def process_objaverse_files(json_path, output_dir):
         except Exception as e:
             print(f"Error processing {glb_file}: {str(e)}")
 
-# Example usage
 json_path = "/home/benzshawelt/.objaverse/hf-objaverse-v1/object-paths.json"
 output_dir = "./objaverse_images"
 process_objaverse_files(json_path, output_dir)
