@@ -7,6 +7,8 @@ import logging
 from dotenv import load_dotenv
 import requests
 import mimetypes
+import warnings
+warnings.filterwarnings('ignore', message='Unverified HTTPS request')
 
 # Set up logging
 logging.basicConfig(
@@ -35,7 +37,7 @@ def upload_images_for_object(object_id, image_paths, angles=None):
             filename = os.path.basename(img_path)
             # Try to extract angle from filename (customize based on your naming convention)
             if "_" in filename:
-                angle = filename.split("_")[0]
+                angle = filename.split("_")[-1].split(".")[0]  # Get the last part before the extension
             else:
                 angle = "unspecified"
             angles.append(angle)
@@ -61,7 +63,7 @@ def upload_images_for_object(object_id, image_paths, angles=None):
                 data = {'angle': angle}
                 
                 # Make the POST request to the API endpoint
-                response = requests.post(upload_url, files=files, data=data)
+                response = requests.post(upload_url, files=files, data=data, verify=False)
                 
                 # Check if the request was successful
                 if response.status_code == 200:

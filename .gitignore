@@ -15,3 +15,5 @@ description_data_generation/LLaVA-NeXT/*
 description_data_generation/check_objaverse_images/*
 description_data_generation/objaverse_xl/*
 description_data_generation/evaluator_assignments.py
+description_data_generation/users_may_25.csv
+description_data_generation/objaverse_descriptions_old/*
