@@ -24,13 +24,16 @@ conda activate llava
 python -m pip install --upgrade pip  # Enable PEP 660 support.
 python -m pip install -e ".[train]"
 
-<!-- python -m pip install flash-attn --no-build-isolationcd  : not working just yet--> 
+Optionally, install
+python -m pip install flash-attn --no-build-isolation
 
 cd ../
 python interleved.py # For simpler description
 OR
 pip install objaverse
 python COT_interleaved.py
+
+If you would like to skip the full model / prompt evaluation pipeline, you only need to evaluate *12 items* to be confident in your quality of your pipeline
 
 add to a .env file in the same dir for your cloudinary service:
 MONGO_URI=...

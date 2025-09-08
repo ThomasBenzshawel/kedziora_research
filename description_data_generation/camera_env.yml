@@ -122,4 +122,3 @@ dependencies:
       - scipy==1.13.1
       - six==1.16.0
       - tifffile==2024.8.30
-prefix: /home/benzshawelt/.conda/envs/camera_dev
