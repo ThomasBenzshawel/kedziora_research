@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=objaverse_render
+#SBATCH --job-name=render_objaverse
 #SBATCH --output=logs/render_%A_%a.out
 #SBATCH --error=logs/render_%A_%a.err
 #SBATCH --array=0-12             # Array indices (0 to N-1 where N is number of GPUs you want)
@@ -19,7 +19,7 @@ source ~/.bashrc
 eval "$(conda shell.bash hook)"
 
 # Activate your conda environment
-conda activate /home/benzshawelt/.conda/envs/camera_dev
+conda activate /home/ad.msoe.edu/benzshawelt/.conda/envs/camera
 
 # Verify environment is active
 echo "Active conda environment: $CONDA_DEFAULT_ENV"

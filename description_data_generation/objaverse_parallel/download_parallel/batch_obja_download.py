@@ -16,28 +16,30 @@ import traceback
 import dotenv
 
 # Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('objaverse_download.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+def setup_logging(job_id: int = 1):
+    """Set up logging with job-specific log files."""
+    log_filename = f'objaverse_download_job_{job_id}.log'
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_filename),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger(__name__)
 
 # Configuration
-
 dotenv.load_dotenv()  # Load environment variables from .env file if present
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 os.environ["GITHUB_TOKEN"] = GITHUB_TOKEN
 os.environ["Github_token"] = GITHUB_TOKEN
 
-def setup_custom_temp_dir(base_dir: str = None):
+def setup_custom_temp_dir(base_dir: str = None, job_id: int = 1):
     """Set up custom temporary directory with more space."""
     if base_dir is None:
-        # Use home directory or current working directory
-        base_dir = os.path.expanduser("~/temp") if os.path.exists(os.path.expanduser("~")) else "./temp"
+        # Use home directory or current working directory with job ID
+        base_dir = os.path.expanduser(f"~/temp/job_{job_id}") if os.path.exists(os.path.expanduser("~")) else f"./temp/job_{job_id}"
     
     # Create temp directory if it doesn't exist
     os.makedirs(base_dir, exist_ok=True)
@@ -114,7 +116,8 @@ def setup_git_lfs_with_token():
 
 class DownloadTracker:
     """Track download results in a thread-safe way."""
-    def __init__(self):
+    def __init__(self, job_id: int = 1):
+        self.job_id = job_id
         self.found_objects = []
         self.modified_objects = []
         self.missing_objects = []
@@ -140,8 +143,9 @@ class DownloadTracker:
                 simple_metadata[str(k)] = f"<unserializable: {type(v).__name__}>"
         return simple_metadata
 
-# Global tracker instance
-tracker = DownloadTracker()
+# Global tracker instance (will be initialized with job ID)
+tracker = None
+logger = None
 
 def safe_handle_found_object(local_path: str, file_identifier: str, sha256: str, metadata: Dict[Hashable, Any]) -> None:
     """Called when an object is successfully found and downloaded."""
@@ -152,7 +156,8 @@ def safe_handle_found_object(local_path: str, file_identifier: str, sha256: str,
             'file_identifier': str(file_identifier),
             'sha256': str(sha256),
             'metadata': simple_metadata,
-            'timestamp': time.time()
+            'timestamp': time.time(),
+            'job_id': tracker.job_id
         })
         tracker.download_paths[str(file_identifier)] = str(local_path)
         logger.info(f"✓ Successfully downloaded: {file_identifier}")
@@ -161,7 +166,8 @@ def safe_handle_found_object(local_path: str, file_identifier: str, sha256: str,
         tracker.errors_encountered.append({
             'type': 'found_object_callback',
             'file_identifier': str(file_identifier),
-            'error': str(e)
+            'error': str(e),
+            'job_id': tracker.job_id
         })
 
 def safe_handle_modified_object(local_path: str, file_identifier: str, new_sha256: str, old_sha256: str, metadata: Dict[Hashable, Any]) -> None:
@@ -174,7 +180,8 @@ def safe_handle_modified_object(local_path: str, file_identifier: str, new_sha25
             'new_sha256': str(new_sha256),
             'old_sha256': str(old_sha256),
             'metadata': simple_metadata,
-            'timestamp': time.time()
+            'timestamp': time.time(),
+            'job_id': tracker.job_id
         })
         tracker.download_paths[str(file_identifier)] = str(local_path)
         logger.warning(f"⚠ Modified object downloaded: {file_identifier}")
@@ -189,7 +196,8 @@ def safe_handle_missing_object(file_identifier: str, sha256: str, metadata: Dict
             'file_identifier': str(file_identifier),
             'sha256': str(sha256),
             'metadata': simple_metadata,
-            'timestamp': time.time()
+            'timestamp': time.time(),
+            'job_id': tracker.job_id
         })
         logger.error(f"✗ Missing object: {file_identifier}")
     except Exception as e:
@@ -204,7 +212,8 @@ def safe_handle_new_object(local_path: str, file_identifier: str, sha256: str, m
             'file_identifier': str(file_identifier),
             'sha256': str(sha256),
             'metadata': simple_metadata,
-            'timestamp': time.time()
+            'timestamp': time.time(),
+            'job_id': tracker.job_id
         })
         logger.info(f"+ New object found: {file_identifier}")
     except Exception as e:
@@ -254,11 +263,13 @@ def download_batch(batch_df, batch_num, total_batches, save_repo_format=None, us
 
 def download_objaverse_xl_robust(
     download_dir: str = "./objaverse_xl",
-    file_types: List[str] = ['glb'],
+    file_types: List[str] = ['glb', 'obj', 'dae', 'gltf', 'stl'],
     max_objects: Optional[int] = None,
     save_repo_format: Optional[str] = None,
     temp_dir: str = None,
-    batch_size: int = 1000
+    batch_size: int = 1000,
+    start_offset: int = 0,
+    job_id: int = 1
 ) -> Dict:
     """
     Download Objaverse XL dataset with robust batch processing and error recovery.
@@ -270,52 +281,62 @@ def download_objaverse_xl_robust(
         save_repo_format: Format to save GitHub repos
         temp_dir: Custom temporary directory
         batch_size: Number of objects to process in each batch
+        start_offset: Starting index for this job (for job arrays)
+        job_id: Job ID for distinguishing parallel jobs
     
     Returns:
         Dictionary with download results
     """
     global tracker
-    tracker = DownloadTracker()  # Reset tracker
+    tracker = DownloadTracker(job_id)  # Initialize tracker with job ID
     
     # Set up custom temporary directory
     if temp_dir is None:
-        temp_dir = os.path.expanduser("~/objaverse_temp")
-    temp_dir = setup_custom_temp_dir(temp_dir)
+        temp_dir = os.path.expanduser(f"~/objaverse_temp/job_{job_id}")
+    temp_dir = setup_custom_temp_dir(temp_dir, job_id)
     
-    logger.info("Setting up git LFS with GitHub token")
+    logger.info(f"Job {job_id}: Setting up git LFS with GitHub token")
     setup_git_lfs_with_token()
     
-    logger.info("Loading Objaverse XL annotations")
+    logger.info(f"Job {job_id}: Loading Objaverse XL annotations")
     try:
         annotations = oxl.get_annotations()
     except Exception as e:
-        logger.error(f"Failed to load annotations: {e}")
+        logger.error(f"Job {job_id}: Failed to load annotations: {e}")
         return {'error': str(e)}
     
     # Filter by file types
     if file_types:
         filtered = annotations[annotations['fileType'].isin(file_types)]
-        logger.info(f"Filtered to {len(filtered)} objects with file types: {file_types}")
+        logger.info(f"Job {job_id}: Filtered to {len(filtered)} objects with file types: {file_types}")
     else:
         filtered = annotations
-        logger.info(f"Using all {len(filtered)} objects")
+        logger.info(f"Job {job_id}: Using all {len(filtered)} objects")
     
     if len(filtered) == 0:
-        logger.warning(f"No objects found with file types: {file_types}")
+        logger.warning(f"Job {job_id}: No objects found with file types: {file_types}")
         return {'error': f'No objects found with file types: {file_types}'}
     
-    # Limit number of objects if specified
-    if max_objects and len(filtered) > max_objects:
-        filtered = filtered.sample(n=max_objects, random_state=42)
-        logger.info(f"Randomly sampled {max_objects} objects")
+    # Apply start offset and limit for this job
+    total_available = len(filtered)
+    end_offset = start_offset + max_objects if max_objects else total_available
+    
+    if start_offset >= total_available:
+        logger.warning(f"Job {job_id}: Start offset {start_offset} exceeds available objects {total_available}")
+        return {'error': f'Start offset {start_offset} exceeds available objects {total_available}'}
+    
+    # Slice the dataset for this job
+    job_subset = filtered.iloc[start_offset:min(end_offset, total_available)]
+    logger.info(f"Job {job_id}: Processing objects {start_offset} to {min(end_offset, total_available)-1}")
+    logger.info(f"Job {job_id}: Total objects for this job: {len(job_subset)}")
     
     # Split into batches
-    total_objects = len(filtered)
+    total_objects = len(job_subset)
     num_batches = (total_objects + batch_size - 1) // batch_size
     
-    logger.info(f"Starting download of {total_objects} objects in {num_batches} batches")
-    logger.info(f"Batch size: {batch_size} objects")
-    logger.info(f"Using temporary directory: {temp_dir}")
+    logger.info(f"Job {job_id}: Starting download of {total_objects} objects in {num_batches} batches")
+    logger.info(f"Job {job_id}: Batch size: {batch_size} objects")
+    logger.info(f"Job {job_id}: Using temporary directory: {temp_dir}")
     
     start_time = time.time()
     failed_batches = []
@@ -324,7 +345,7 @@ def download_objaverse_xl_robust(
     for batch_num in range(num_batches):
         start_idx = batch_num * batch_size
         end_idx = min(start_idx + batch_size, total_objects)
-        batch_df = filtered.iloc[start_idx:end_idx]
+        batch_df = job_subset.iloc[start_idx:end_idx]
         
         # Try with multiprocessing first
         success, error_type = download_batch(
@@ -337,7 +358,7 @@ def download_objaverse_xl_robust(
         
         # If failed due to pickling, retry with single process
         if not success and error_type == "pickling_error":
-            logger.info(f"Retrying batch {batch_num + 1} with single process due to pickling error")
+            logger.info(f"Job {job_id}: Retrying batch {batch_num + 1} with single process due to pickling error")
             success, error_type = download_batch(
                 batch_df,
                 batch_num + 1,
@@ -348,7 +369,7 @@ def download_objaverse_xl_robust(
             
             if not success:
                 # If still failing, try individual objects
-                logger.warning(f"Batch {batch_num + 1} still failing, trying individual objects")
+                logger.warning(f"Job {job_id}: Batch {batch_num + 1} still failing, trying individual objects")
                 for idx, row in batch_df.iterrows():
                     try:
                         single_df = pd.DataFrame([row])
@@ -362,11 +383,12 @@ def download_objaverse_xl_robust(
                             processes=1,
                         )
                     except Exception as e:
-                        logger.error(f"Failed to download object {row.get('fileIdentifier', 'unknown')}: {e}")
+                        logger.error(f"Job {job_id}: Failed to download object {row.get('fileIdentifier', 'unknown')}: {e}")
                         tracker.problematic_objects.append({
                             'file_identifier': str(row.get('fileIdentifier', 'unknown')),
                             'error': str(e),
-                            'row_data': row.to_dict()
+                            'row_data': row.to_dict(),
+                            'job_id': job_id
                         })
         
         elif not success:
@@ -384,6 +406,8 @@ def download_objaverse_xl_robust(
     total_requested = total_objects
     
     summary = {
+        'job_id': job_id,
+        'start_offset': start_offset,
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
         'duration_seconds': round(duration, 2),
         'total_requested': total_requested,
@@ -398,19 +422,20 @@ def download_objaverse_xl_robust(
         'objects_per_second': len(tracker.found_objects) / duration if duration > 0 else 0
     }
     
-    # Save metadata and reports
-    output_dir = "./"
+    # Save metadata and reports with job ID
+    output_dir = f"./output/job_{job_id}"
+    os.makedirs(output_dir, exist_ok=True)
     
-    # Export filtered annotations to CSV
-    metadata_file = os.path.join(output_dir, "objaverse_xl_metadata.csv")
+    # Export processed subset to CSV
+    metadata_file = os.path.join(output_dir, f"objaverse_xl_metadata_job_{job_id}.csv")
     try:
-        filtered.to_csv(metadata_file, index=False)
-        logger.info(f"Saved metadata to {metadata_file}")
+        job_subset.to_csv(metadata_file, index=False)
+        logger.info(f"Job {job_id}: Saved metadata to {metadata_file}")
     except Exception as e:
-        logger.error(f"Failed to save metadata: {e}")
+        logger.error(f"Job {job_id}: Failed to save metadata: {e}")
     
     # Save detailed report
-    report_file = os.path.join(output_dir, "download_report.json")
+    report_file = os.path.join(output_dir, f"download_report_job_{job_id}.json")
     detailed_report = {
         'summary': summary,
         'found_objects': tracker.found_objects,
@@ -426,22 +451,22 @@ def download_objaverse_xl_robust(
     try:
         with open(report_file, 'w') as f:
             json.dump(detailed_report, f, indent=4, default=str)
-        logger.info(f"Detailed download report saved to {report_file}")
+        logger.info(f"Job {job_id}: Detailed download report saved to {report_file}")
     except Exception as e:
-        logger.error(f"Failed to save report: {e}")
+        logger.error(f"Job {job_id}: Failed to save report: {e}")
     
     # Save problematic objects separately for debugging
     if tracker.problematic_objects:
-        problematic_file = os.path.join(output_dir, "problematic_objects.json")
+        problematic_file = os.path.join(output_dir, f"problematic_objects_job_{job_id}.json")
         try:
             with open(problematic_file, 'w') as f:
                 json.dump(tracker.problematic_objects, f, indent=4, default=str)
-            logger.warning(f"Saved {len(tracker.problematic_objects)} problematic objects to {problematic_file}")
+            logger.warning(f"Job {job_id}: Saved {len(tracker.problematic_objects)} problematic objects to {problematic_file}")
         except Exception as e:
-            logger.error(f"Failed to save problematic objects: {e}")
+            logger.error(f"Job {job_id}: Failed to save problematic objects: {e}")
     
     # Log summary
-    logger.info(f"Download Summary:")
+    logger.info(f"Job {job_id}: Download Summary:")
     logger.info(f"  Total requested: {summary['total_requested']}")
     logger.info(f"  Successfully downloaded: {summary['found_objects']}")
     logger.info(f"  Modified objects: {summary['modified_objects']}")
@@ -455,7 +480,7 @@ def download_objaverse_xl_robust(
     
     # Log any problematic objects
     if tracker.problematic_objects:
-        logger.warning(f"Encountered {len(tracker.problematic_objects)} problematic objects:")
+        logger.warning(f"Job {job_id}: Encountered {len(tracker.problematic_objects)} problematic objects:")
         for obj in tracker.problematic_objects[:5]:  # Show first 5
             logger.warning(f"  - {obj['file_identifier']}: {obj['error']}")
         if len(tracker.problematic_objects) > 5:
@@ -468,60 +493,75 @@ def download_objaverse_xl_robust(
         'detailed_report': detailed_report
     }
 
-def download_objaverse_regular(num_objects: int = 100000, temp_dir: str = None):
-    """Download regular Objaverse dataset with custom temp directory."""
+def download_objaverse_regular(num_objects: int = 100000, temp_dir: str = None, start_offset: int = 0, job_id: int = 1):
+    """Download regular Objaverse dataset with custom temp directory and job support."""
     # Set up custom temporary directory
     if temp_dir is None:
-        temp_dir = os.path.expanduser("~/objaverse_temp")
-    setup_custom_temp_dir(temp_dir)
+        temp_dir = os.path.expanduser(f"~/objaverse_temp/job_{job_id}")
+    setup_custom_temp_dir(temp_dir, job_id)
     
-    logger.info(f"Downloading {num_objects} random objects from Objaverse")
+    logger.info(f"Job {job_id}: Downloading {num_objects} objects from Objaverse starting at offset {start_offset}")
     
     try:
         uids = objaverse.load_uids()
-        if num_objects > len(uids):
-            logger.warning(f"Requested {num_objects} objects, but only {len(uids)} available. Downloading all.")
-            num_objects = len(uids)
-
-        random_object_uids = random.sample(uids, num_objects)
+        total_available = len(uids)
         
+        if start_offset >= total_available:
+            logger.warning(f"Job {job_id}: Start offset {start_offset} exceeds available objects {total_available}")
+            return
+        
+        # Calculate end offset
+        end_offset = min(start_offset + num_objects, total_available)
+        
+        # Get subset of UIDs for this job
+        job_uids = uids[start_offset:end_offset]
+        actual_objects = len(job_uids)
+        
+        logger.info(f"Job {job_id}: Processing {actual_objects} objects from offset {start_offset} to {end_offset-1}")
+
         # Load metadata for these objects
-        annotations = objaverse.load_annotations(random_object_uids)
+        annotations = objaverse.load_annotations(job_uids)
         
         # Try with single process first (more stable)
         try:
             objects = objaverse.load_objects(
-                uids=random_object_uids,
+                uids=job_uids,
                 download_processes=1)  # Use single process to avoid issues
         except Exception as e:
-            logger.warning(f"Single process download failed: {e}, trying with multiprocessing")
+            logger.warning(f"Job {job_id}: Single process download failed: {e}, trying with multiprocessing")
             objects = objaverse.load_objects(
-                uids=random_object_uids,
+                uids=job_uids,
                 download_processes=mp.cpu_count())
         
         # save the uids and file paths to a JSON file
-        output_dir = "./"
-        output_file = os.path.join(output_dir, "objaverse_metadata.json")
+        output_dir = f"./output/job_{job_id}"
+        os.makedirs(output_dir, exist_ok=True)
+        output_file = os.path.join(output_dir, f"objaverse_metadata_job_{job_id}.json")
         with open(output_file, 'w') as f:
             json.dump({
+                "job_id": job_id,
+                "start_offset": start_offset,
+                "objects_processed": actual_objects,
                 "objects": objects
             }, f, indent=4)
-        logger.info(f"Saved metadata to {output_file}")
+        logger.info(f"Job {job_id}: Saved metadata to {output_file}")
         
     except Exception as e:
-        logger.error(f"Failed to download regular Objaverse: {e}")
+        logger.error(f"Job {job_id}: Failed to download regular Objaverse: {e}")
         raise
 
 def download_objaverse(
     xl: bool = False,
     num_objects: int = 10000,
-    file_types: List[str] = ['glb'],
+    file_types: List[str] = ['glb', 'obj', 'dae', 'gltf', 'stl'],
     save_repos: bool = True,
     temp_dir: str = None,
-    batch_size: int = 1000
+    batch_size: int = 1000,
+    start_offset: int = 0,
+    job_id: int = 1
 ):
     """
-    Main download function with custom temporary directory support.
+    Main download function with custom temporary directory support and job array functionality.
     
     Args:
         xl: Whether to download Objaverse XL dataset
@@ -530,9 +570,12 @@ def download_objaverse(
         save_repos: Whether to save GitHub repositories (XL only)
         temp_dir: Custom temporary directory path
         batch_size: Number of objects per batch for XL downloads
+        start_offset: Starting index for this job (for job arrays)
+        job_id: Job ID for distinguishing parallel jobs
     """
     if xl:
-        logger.info("Starting Objaverse XL download with robust batch processing")
+        logger.info(f"Job {job_id}: Starting Objaverse XL download with robust batch processing")
+        logger.info(f"Job {job_id}: Processing {num_objects} objects starting from offset {start_offset}")
         save_repo_format = "files" if save_repos else None
         max_objects = num_objects if num_objects < 100000 else None
         
@@ -541,28 +584,30 @@ def download_objaverse(
             max_objects=max_objects,
             save_repo_format=save_repo_format,
             temp_dir=temp_dir,
-            batch_size=batch_size
+            batch_size=batch_size,
+            start_offset=start_offset,
+            job_id=job_id
         )
         
         if 'error' in results:
-            logger.error(f"XL Download failed: {results['error']}")
+            logger.error(f"Job {job_id}: XL Download failed: {results['error']}")
             return False
         
-        logger.info("XL Download completed successfully!")
+        logger.info(f"Job {job_id}: XL Download completed successfully!")
         return True
     else:
         # Use updated implementation for regular Objaverse
         try:
-            download_objaverse_regular(num_objects, temp_dir)
+            download_objaverse_regular(num_objects, temp_dir, start_offset, job_id)
             return True
         except Exception as e:
-            logger.error(f"Regular Objaverse download failed: {e}")
+            logger.error(f"Job {job_id}: Regular Objaverse download failed: {e}")
             return False
 
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Download Objaverse dataset with robust error handling.")
+    parser = argparse.ArgumentParser(description="Download Objaverse dataset with robust error handling and job array support.")
     parser.add_argument(
         "--xl",
         action="store_true",
@@ -578,7 +623,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--file-types",
         nargs='+',
-        default=['glb'],
+        default=['glb', 'obj', 'dae', 'gltf', 'stl'],
         help="File types to download for XL dataset (e.g., glb obj fbx). Default: glb",
     )
     parser.add_argument(
@@ -591,7 +636,7 @@ if __name__ == "__main__":
         "--temp-dir",
         type=str,
         default=None,
-        help="Custom temporary directory path. Default: ~/objaverse_temp",
+        help="Custom temporary directory path. Default: ~/objaverse_temp/job_X",
     )
     parser.add_argument(
         "--batch-size",
@@ -599,8 +644,23 @@ if __name__ == "__main__":
         default=1000,
         help="Number of objects per batch for XL downloads. Default: 1000",
     )
+    parser.add_argument(
+        "--start-offset",
+        type=int,
+        default=0,
+        help="Starting index for this job (for job arrays). Default: 0",
+    )
+    parser.add_argument(
+        "--job-id",
+        type=int,
+        default=1,
+        help="Job ID for distinguishing parallel jobs. Default: 1",
+    )
     
     args = parser.parse_args()
+    
+    # Initialize logging with job ID
+    logger = setup_logging(args.job_id)
     
     try:
         success = download_objaverse(
@@ -609,12 +669,14 @@ if __name__ == "__main__":
             file_types=args.file_types,
             save_repos=False,
             temp_dir=args.temp_dir,
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
+            start_offset=args.start_offset,
+            job_id=args.job_id
         )
         exit(0 if success else 1)
     except KeyboardInterrupt:
-        logger.info("Download interrupted by user")
+        logger.info(f"Job {args.job_id}: Download interrupted by user")
         exit(1)
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
+        logger.error(f"Job {args.job_id}: Unexpected error: {e}")
         exit(1)

@@ -15,7 +15,7 @@ You wll get errors for 2-channel textures, those objects will be ignored, they w
 There will also be warnings for black and white images, those are typically objects that are not within the veiw of the camera (either they are too large, or were never put in the .glb file)
 There are a few objects that have multiple files within it for one reason or another, those will give you the Expected a Trimesh or a list, got a <class 'trimesh.path.path.Path3D'> error.
 
-conda env create -f llava_environment.yml
+<!-- conda env create -f llava_environment.yml -->
 
 git clone https://github.com/LLaVA-VL/LLaVA-NeXT
 cd LLaVA-NeXT
