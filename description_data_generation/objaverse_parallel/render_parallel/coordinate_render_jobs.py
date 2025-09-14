@@ -138,7 +138,7 @@ def main():
     parser = argparse.ArgumentParser(description='Coordinate parallel Objaverse rendering')
     parser.add_argument('--num_gpus', type=int, required=False, 
                        help='Number of GPUs to use')
-    parser.add_argument('--json_path', required=False,
+    parser.add_argument('--json_path', required=False, default="/home/ad.msoe.edu/benzshawelt/.objaverse/hf-objaverse-v1/object-paths.json",
                        help='Path to object-paths.json')
     parser.add_argument('--output_dir', default='../objaverse_images',
                        help='Output directory for images')

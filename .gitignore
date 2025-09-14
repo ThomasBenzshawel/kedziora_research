@@ -3,6 +3,9 @@
 *slurm*
 *__pycache*
 .vscode
+*.env
+*.json
+.conda/*
 layer_x_layer/data_gen/ply_files/*
 layer_x_layer/data_gen/glb_conversion.log
 layer_x_layer/data_gen/temp_vox/*
@@ -36,3 +39,12 @@ description_data_generation/objaverse_parallel/description_parallel/objaverse_me
 description_data_generation/objaverse_parallel/description_parallel/objaverse_metadata_cache_worker_7.json
 description_data_generation/objaverse_parallel/description_parallel/objaverse_metadata_cache_worker_8.json
 layer_x_layer/layer_x_layer_from_scratch/data/*
+description_data_generation/objaverse_parallel/download_parallel/.env
+description_data_generation/objaverse_parallel/download_parallel/objaverse_download_job_*.log
+*.log
+*.npy
+*.glb
+*.ply
+*.obj
+*.png
+*.jpg
