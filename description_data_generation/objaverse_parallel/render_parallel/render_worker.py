@@ -3,6 +3,8 @@
 Worker script for parallel 3D object rendering on SLURM cluster
 Enhanced to support both JSON file and directory scanning for 3D files
 Added empty scene detection to skip invalid/empty 3D models
+Added functionality to delete bad files and maintain bad items list
+Fixed duplicate directory scanning and memory leak issues
 """
 
 import trimesh
@@ -20,6 +22,13 @@ import time
 import argparse
 import sys
 from pathlib import Path
+import threading
+from datetime import datetime
+import shutil
+import gc  # Added for garbage collection
+
+# Global lock for writing to bad items list
+bad_items_lock = threading.Lock()
 
 def get_supported_extensions():
     """
@@ -27,9 +36,127 @@ def get_supported_extensions():
     """
     return {'.glb', '.gltf', '.obj', '.ply', '.stl', '.dae', '.3ds', '.fbx', '.x3d', '.off'}
 
+def get_bad_items_list_path():
+    """
+    Get the path for the bad items list file in the directory above the script location.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(script_dir)
+    return os.path.join(parent_dir, "bad_items_list.json")
+
+def add_to_bad_items_list(uid, file_path, reason, worker_id):
+    """
+    Safely add an item to the bad items list with thread safety.
+    
+    Args:
+        uid (str): Unique identifier of the failed item
+        file_path (str): Path to the original 3D file
+        reason (str): Reason for failure ('empty_scene', 'render_error', 'incomplete_renders')
+        worker_id (int): ID of the worker that processed this item
+    """
+    bad_items_file = get_bad_items_list_path()
+    
+    # Create the entry
+    entry = {
+        "uid": uid,
+        "original_file_path": file_path,
+        "reason": reason,
+        "worker_id": worker_id,
+        "timestamp": datetime.now().isoformat(),
+        "deleted": False  # Will be updated after successful deletion
+    }
+    
+    with bad_items_lock:
+        # Load existing bad items list
+        bad_items = []
+        if os.path.exists(bad_items_file):
+            try:
+                with open(bad_items_file, 'r', encoding='utf-8') as f:
+                    bad_items = json.load(f)
+            except (json.JSONDecodeError, FileNotFoundError):
+                bad_items = []
+        
+        # Add new entry
+        bad_items.append(entry)
+        
+        # Write back to file
+        try:
+            with open(bad_items_file, 'w', encoding='utf-8') as f:
+                json.dump(bad_items, f, indent=2, ensure_ascii=False)
+            return True
+        except Exception as e:
+            print(f"Error writing to bad items list: {e}")
+            return False
+
+def update_bad_item_deletion_status(uid, deleted_successfully):
+    """
+    Update the deletion status of an item in the bad items list.
+    
+    Args:
+        uid (str): Unique identifier of the item
+        deleted_successfully (bool): Whether the file was successfully deleted
+    """
+    bad_items_file = get_bad_items_list_path()
+    
+    with bad_items_lock:
+        try:
+            # Load existing bad items list
+            if os.path.exists(bad_items_file):
+                with open(bad_items_file, 'r', encoding='utf-8') as f:
+                    bad_items = json.load(f)
+                
+                # Update the entry
+                for item in bad_items:
+                    if item['uid'] == uid:
+                        item['deleted'] = deleted_successfully
+                        break
+                
+                # Write back to file
+                with open(bad_items_file, 'w', encoding='utf-8') as f:
+                    json.dump(bad_items, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"Error updating bad items list deletion status: {e}")
+
+def delete_bad_file_and_log(uid, file_path, reason, worker_id):
+    """
+    Delete a bad 3D model file and add it to the bad items list.
+    
+    Args:
+        uid (str): Unique identifier of the failed item
+        file_path (str): Path to the original 3D file
+        reason (str): Reason for failure
+        worker_id (int): ID of the worker that processed this item
+    
+    Returns:
+        bool: True if file was successfully deleted, False otherwise
+    """
+    # First, add to bad items list
+    if not add_to_bad_items_list(uid, file_path, reason, worker_id):
+        print(f"Failed to log bad item to list: {uid}")
+        return False
+    
+    # Then try to delete the file
+    deleted_successfully = False
+    if os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+            deleted_successfully = True
+            print(f"Deleted bad file: {file_path} (Reason: {reason})")
+        except Exception as e:
+            print(f"Error deleting file {file_path}: {e}")
+            deleted_successfully = False
+    else:
+        print(f"File not found for deletion: {file_path}")
+        deleted_successfully = False
+    
+    # Update the deletion status in the bad items list
+    update_bad_item_deletion_status(uid, deleted_successfully)
+    
+    return deleted_successfully
+
 def scan_directory_for_3d_files(root_dir, use_folder_name_as_uid=True):
     """
-    Scan a directory structure for 3D files and create a mapping similar to the JSON format.
+    Scan a directory structure for 3D files and create a mapping with absolute paths.
    
     Args:
         root_dir (str): Root directory to scan
@@ -37,7 +164,7 @@ def scan_directory_for_3d_files(root_dir, use_folder_name_as_uid=True):
                                      If False, generate UID from file path.
    
     Returns:
-        dict: Mapping of UIDs to file paths
+        dict: Mapping of UIDs to absolute file paths
     """
     root_path = Path(root_dir)
     if not root_path.exists():
@@ -64,9 +191,8 @@ def scan_directory_for_3d_files(root_dir, use_folder_name_as_uid=True):
                 relative_path = file_path.relative_to(root_path)
                 uid = str(relative_path).replace(os.sep, '_').replace('.', '_')
            
-            # Store relative path from root directory
-            relative_file_path = file_path.relative_to(root_path)
-            object_paths[uid] = str(relative_file_path)
+            # Store absolute path instead of relative path
+            object_paths[uid] = str(file_path.absolute())
    
     print(f"Found {len(object_paths)} 3D files")
     return object_paths
@@ -218,6 +344,10 @@ def render_glb(glb_path, output_prefix, resolution=(800, 600), check_dir=None):
     Returns:
         bool: True if successfully rendered, False if scene was empty or error occurred
     """
+    scene = None
+    pyrender_scene = None
+    r = None
+    
     try:
         scene = trimesh.load(glb_path)
         
@@ -312,15 +442,61 @@ def render_glb(glb_path, output_prefix, resolution=(800, 600), check_dir=None):
                     output_path = f"{output_prefix}_{perspectives[i]}.jpg"
                     os.makedirs(os.path.dirname(output_path), exist_ok=True)
                     img.save(output_path, 'JPEG', quality=95)
+                
+                # Clean up image object
+                del img
 
             pyrender_scene.remove_node(light_node)
+            
+            # Force garbage collection periodically to prevent memory buildup
+            if i % 3 == 0:
+                gc.collect()
         
         return True
         
     except Exception as e:
         print(f"Error rendering {glb_path}: {str(e)}")
         return False
+    finally:
+        # Clean up resources to prevent memory leaks
+        if r is not None:
+            try:
+                r.delete()  # Clean up OpenGL context
+            except Exception as e:
+                print(f"Error cleaning up renderer: {e}")
+        
+        # Clear large objects and force garbage collection
+        if pyrender_scene is not None:
+            try:
+                del pyrender_scene
+            except Exception as e:
+                print(f"Error cleaning up pyrender scene: {e}")
+                
+        if scene is not None:
+            try:
+                del scene
+            except Exception as e:
+                print(f"Error cleaning up trimesh scene: {e}")
+        
+        # Force garbage collection after processing each file
+        gc.collect()
+
+def check_complete_renders(output_dir_path, uid):
+    """
+    Check if all 6 rendered images exist for a given UID.
     
+    Args:
+        output_dir_path (str): Path to the object's output directory
+        uid (str): Unique identifier of the object
+        
+    Returns:
+        bool: True if all 6 images exist, False otherwise
+    """
+    expected_files = ['front', 'back', 'right', 'left', 'up', 'down']
+    return all(
+        os.path.exists(os.path.join(output_dir_path, f"{uid}_{view}.jpg")) 
+        for view in expected_files
+    )
 
 def is_black_and_white(image, color_threshold=10, saturation_threshold=20, value_range_threshold=30):
     # Convert to HSV for better color analysis
@@ -378,54 +554,121 @@ def get_work_chunk(object_paths, chunk_id, total_chunks):
     
     return dict(items[start_idx:end_idx])
 
-def load_object_paths(json_path, scan_dir=None, use_folder_name_as_uid=True):
+def load_object_paths(json_path, scan_directories=None, use_folder_name_as_uid=True):
     """
-    Load object paths from JSON file and optionally scan directory for additional files.
+    Load object paths from JSON file and optionally scan directories for additional files.
     
     Args:
         json_path (str): Path to JSON file with object paths
-        scan_dir (str, optional): Directory to scan for additional 3D files
+        scan_directories (list): List of directories to scan for additional 3D files
         use_folder_name_as_uid (bool): Whether to use folder names as UIDs when scanning
         
     Returns:
-        dict: Combined mapping of UIDs to file paths
-        str: Base directory for resolving relative paths
+        dict: Combined mapping of UIDs to absolute file paths
     """
     all_object_paths = {}
-    base_dir = None
     
     # First, load from JSON if it exists
     if json_path and os.path.exists(json_path):
         print(f"Loading object paths from JSON: {json_path}")
         with open(json_path, 'rt', encoding='utf-8') as f:
             json_object_paths = json.load(f)
-        all_object_paths.update(json_object_paths)
+        
+        # Convert JSON relative paths to absolute paths
         base_dir = os.path.dirname(json_path)
+        for uid, relative_path in json_object_paths.items():
+            absolute_path = os.path.abspath(os.path.join(base_dir, relative_path))
+            all_object_paths[uid] = absolute_path
+            
         print(f"Loaded {len(json_object_paths)} objects from JSON")
     else:
         print(f"JSON file not found or not provided: {json_path}")
     
-    # Then, scan directory for additional files if provided
-    if scan_dir and os.path.exists(scan_dir):
-        print(f"Scanning directory for additional 3D files: {scan_dir}")
-        try:
-            scanned_object_paths = scan_directory_for_3d_files(scan_dir, use_folder_name_as_uid)
-            all_object_paths.update(scanned_object_paths)
-            
-            # If no base_dir from JSON, use scan_dir as base
-            if base_dir is None:
-                base_dir = scan_dir
-                
-            print(f"Added {len(scanned_object_paths)} objects from directory scan")
-        except Exception as e:
-            print(f"Error scanning directory {scan_dir}: {e}")
-    else:
-        print(f"Scan directory not found or not provided: {scan_dir}")
+    # Then, scan directories for additional files if provided
+    if scan_directories:
+        for scan_dir in scan_directories:
+            if scan_dir and os.path.exists(scan_dir):
+                print(f"Scanning directory for 3D files: {scan_dir}")
+                try:
+                    scanned_object_paths = scan_directory_for_3d_files(scan_dir, use_folder_name_as_uid)
+                    
+                    # Handle UID conflicts by appending directory name
+                    for uid, absolute_path in scanned_object_paths.items():
+                        if uid in all_object_paths:
+                            # Add directory name to make UID unique
+                            dir_name = os.path.basename(scan_dir)
+                            unique_uid = f"{uid}_{dir_name}"
+                            all_object_paths[unique_uid] = absolute_path
+                        else:
+                            all_object_paths[uid] = absolute_path
+                    
+                    print(f"Added {len(scanned_object_paths)} objects from directory scan: {scan_dir}")
+                except Exception as e:
+                    print(f"Error scanning directory {scan_dir}: {e}")
+            else:
+                print(f"Scan directory not found or not provided: {scan_dir}")
     
     print(f"Total objects to process: {len(all_object_paths)}")
-    return all_object_paths, base_dir
+    return all_object_paths
 
-def process_chunk(json_path, output_dir, chunk_id, total_chunks, scan_dir=None, 
+def cleanup_incomplete_renders(output_dir, all_object_paths, worker_id):
+    """
+    Check previously rendered objects and delete originals with incomplete renders.
+    This should only be called by one worker to avoid conflicts.
+    
+    Args:
+        output_dir (str): Output directory containing rendered images
+        all_object_paths (dict): Mapping of UIDs to original file paths
+        worker_id (int): ID of the worker performing cleanup
+        
+    Returns:
+        int: Number of files deleted during cleanup
+    """
+    if not os.path.exists(output_dir):
+        print("Output directory doesn't exist, skipping cleanup")
+        return 0
+    
+    print("Starting cleanup of incomplete renders...")
+    deleted_count = 0
+    
+    # Get all existing output directories
+    try:
+        existing_dirs = [d for d in os.listdir(output_dir) 
+                        if os.path.isdir(os.path.join(output_dir, d)) and not d.startswith('worker_')]
+    except OSError as e:
+        print(f"Error listing output directory: {e}")
+        return 0
+    
+    print(f"Found {len(existing_dirs)} existing output directories to check")
+    
+    for uid in existing_dirs:
+        output_dir_path = os.path.join(output_dir, uid)
+        
+        # Check if this UID has complete renders
+        if not check_complete_renders(output_dir_path, uid):
+            # Incomplete renders found - try to find and delete original file
+            if uid in all_object_paths:
+                original_file_path = all_object_paths[uid]
+                if os.path.exists(original_file_path):
+                    print(f"Cleanup: Found incomplete renders for {uid}, deleting original file")
+                    if delete_bad_file_and_log(uid, original_file_path, "incomplete_renders_cleanup", worker_id):
+                        deleted_count += 1
+                else:
+                    print(f"Cleanup: Original file already deleted for {uid}")
+            else:
+                print(f"Cleanup: Could not find original file path for {uid} (not in current batch)")
+            
+            # Also remove the incomplete output directory
+            try:
+                shutil.rmtree(output_dir_path)
+                print(f"Cleanup: Removed incomplete output directory for {uid}")
+            except Exception as e:
+                print(f"Cleanup: Error removing output directory {output_dir_path}: {e}")
+    
+    print(f"Cleanup completed: {deleted_count} files deleted")
+    return deleted_count
+
+def process_chunk(json_path, output_dir, chunk_id, total_chunks, scan_dir=None, scan_dir_2=None,
                  use_folder_name_as_uid=True, log_file=None, check_dir=None):
     """Process a chunk of the 3D dataset from JSON and/or directory scanning"""
     
@@ -436,13 +679,31 @@ def process_chunk(json_path, output_dir, chunk_id, total_chunks, scan_dir=None,
     
     print(f"Worker {chunk_id}/{total_chunks} starting...")
     print(f"GPU: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Unknown')}")
-    
+    print(f"Scan Directory: {scan_dir}")
+    print(f"Scan Directory 2: {scan_dir_2}")
+
+    # Prepare list of directories to scan, avoiding duplicates
+    scan_directories = []
+    if scan_dir:
+        scan_directories.append(scan_dir)
+    if scan_dir_2:
+        # Only add scan_dir_2 if it's different from scan_dir
+        if not scan_dir or os.path.abspath(scan_dir_2) != os.path.abspath(scan_dir):
+            scan_directories.append(scan_dir_2)
+        else:
+            print(f"Note: scan_dir_2 is identical to scan_dir, skipping duplicate: {scan_dir_2}")
+
     # Load object paths from JSON and/or directory scanning
-    all_object_paths, base_dir = load_object_paths(json_path, scan_dir, use_folder_name_as_uid)
+    all_object_paths = load_object_paths(json_path, scan_directories, use_folder_name_as_uid)
     
     if not all_object_paths:
         print("No objects found to process!")
         return
+    
+    # Only worker 0 performs cleanup of incomplete renders from previous runs
+    cleanup_deleted = 0
+    if chunk_id == 0:
+        cleanup_deleted = cleanup_incomplete_renders(output_dir, all_object_paths, chunk_id)
     
     # Get this worker's chunk
     object_paths = get_work_chunk(all_object_paths, chunk_id, total_chunks)
@@ -455,55 +716,68 @@ def process_chunk(json_path, output_dir, chunk_id, total_chunks, scan_dir=None,
     processed = 0
     errors = 0
     empty_scenes = 0
+    deleted_files = 0
     
     # Process objects in this chunk
-    for uid, file_path in tqdm(object_paths.items(), 
+    for uid, absolute_file_path in tqdm(object_paths.items(), 
                               desc=f"Worker {chunk_id}"):
-        # Construct the full path to the 3D file
-        if base_dir:
-            full_file_path = os.path.join(base_dir, file_path)
-        else:
-            full_file_path = file_path
         
         # Check if the file exists
-        if not os.path.exists(full_file_path):
-            print(f"File not found: {full_file_path}")
+        if not os.path.exists(absolute_file_path):
+            print(f"File not found: {absolute_file_path}")
             errors += 1
             continue
 
         # Skip if already processed
-        if os.path.exists(os.path.join(output_dir, uid)):
+        output_dir_path = os.path.join(output_dir, uid)
+        if os.path.exists(output_dir_path):
             # Check if the directory has actual rendered images
-            output_dir_path = os.path.join(output_dir, uid)
-            expected_files = ['front', 'back', 'right', 'left', 'up', 'down']
-            all_files_exist = all(
-                os.path.exists(os.path.join(output_dir_path, f"{uid}_{view}.jpg")) 
-                for view in expected_files
-            )
-            
-            if all_files_exist:
+            if check_complete_renders(output_dir_path, uid):
                 print(f"Directory already exists with complete renders for {uid}, skipping.")
                 continue
             else:
                 print(f"Directory exists but incomplete renders for {uid}, re-processing.")
         else:
-            os.makedirs(os.path.join(output_dir, uid), exist_ok=True)
+            os.makedirs(output_dir_path, exist_ok=True)
         
         # Create an output prefix for this object 
-        output_prefix = os.path.join(output_dir, uid, uid)
+        output_prefix = os.path.join(output_dir_path, uid)
         
         try:
-            # Render the 3D file
-            success = render_glb(full_file_path, output_prefix, check_dir=check_dir)
+            # Render the 3D file (absolute_file_path is already absolute)
+            success = render_glb(absolute_file_path, output_prefix, check_dir=check_dir)
+            
             if success:
-                processed += 1
+                # Check if all 6 images were actually created
+                if check_complete_renders(output_dir_path, uid):
+                    processed += 1
+                else:
+                    # Incomplete renders - delete file and log as bad
+                    print(f"Incomplete renders for {uid}, deleting original file")
+                    if delete_bad_file_and_log(uid, absolute_file_path, "incomplete_renders", chunk_id):
+                        deleted_files += 1
+                    errors += 1
             else:
+                # Empty scene - delete file and log as bad
+                print(f"Empty scene for {uid}, deleting original file")
+                if delete_bad_file_and_log(uid, absolute_file_path, "empty_scene", chunk_id):
+                    deleted_files += 1
                 empty_scenes += 1
+                
         except Exception as e:
-            print(f"Error processing {full_file_path}: {str(e)}")
+            print(f"Error processing {absolute_file_path}: {str(e)}")
+            # Render error - delete file and log as bad
+            if delete_bad_file_and_log(uid, absolute_file_path, "render_error", chunk_id):
+                deleted_files += 1
             errors += 1
+        
+        # Force garbage collection every 10 objects to prevent memory accumulation
+        if (processed + errors + empty_scenes) % 10 == 0:
+            gc.collect()
     
-    print(f"Worker {chunk_id} completed: {processed} processed, {errors} errors, {empty_scenes} empty scenes skipped")
+    print(f"Worker {chunk_id} completed: {processed} processed, {errors} errors, {empty_scenes} empty scenes skipped, {deleted_files} files deleted")
+    if chunk_id == 0 and cleanup_deleted > 0:
+        print(f"Worker {chunk_id} cleanup: {cleanup_deleted} incomplete renders cleaned up")
     
     # Write completion status
     status_file = os.path.join(output_dir, f"worker_{chunk_id}_status.txt")
@@ -511,12 +785,15 @@ def process_chunk(json_path, output_dir, chunk_id, total_chunks, scan_dir=None,
         f.write(f"processed: {processed}\n")
         f.write(f"errors: {errors}\n")
         f.write(f"empty_scenes: {empty_scenes}\n")
+        f.write(f"deleted_files: {deleted_files}\n")
+        f.write(f"cleanup_deleted: {cleanup_deleted}\n")
         f.write(f"total_assigned: {len(object_paths)}\n")
 
 def main():
     parser = argparse.ArgumentParser(description='Render 3D objects in parallel from JSON and/or directory scanning')
     parser.add_argument('--json_path', help='Path to object-paths.json (optional)')
     parser.add_argument('--scan_dir', help='Directory to scan for 3D files (optional)')
+    parser.add_argument('--scan_dir_2', help='Second directory to scan for 3D files (optional)')
     parser.add_argument('--output_dir', required=True, help='Output directory for images')
     parser.add_argument('--chunk_id', type=int, required=True, help='Chunk ID (0-indexed)')
     parser.add_argument('--total_chunks', type=int, required=True, help='Total number of chunks')
@@ -528,12 +805,12 @@ def main():
     args = parser.parse_args()
     
     # Validate that at least one source is provided
-    if not args.json_path and not args.scan_dir:
+    if not args.json_path and not args.scan_dir and not args.scan_dir_2:
         print("Error: Must provide either --json_path or --scan_dir (or both)")
         sys.exit(1)
     
     process_chunk(args.json_path, args.output_dir, args.chunk_id, 
-                 args.total_chunks, args.scan_dir, args.use_folder_name_as_uid, 
+                 args.total_chunks, args.scan_dir, args.scan_dir_2, args.use_folder_name_as_uid, 
                  args.log_file, args.check_dir)
 
 if __name__ == "__main__":

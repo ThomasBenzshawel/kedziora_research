@@ -48,3 +48,15 @@ description_data_generation/objaverse_parallel/download_parallel/objaverse_downl
 *.obj
 *.png
 *.jpg
+*.pkl
+*.out
+*.err
+layer_x_layer/training_from_scratch/data/cifar-10-batches-py/data_batch_1
+layer_x_layer/training_from_scratch/data/cifar-10-batches-py/data_batch_2
+layer_x_layer/training_from_scratch/data/cifar-10-batches-py/data_batch_3
+layer_x_layer/training_from_scratch/data/cifar-10-batches-py/data_batch_4
+layer_x_layer/training_from_scratch/data/cifar-10-batches-py/data_batch_5
+layer_x_layer/training_from_scratch/data/cifar-10-python.tar.gz
+layer_x_layer/training_from_scratch/data/cifar-10-batches-py/test_batch
+layer_x_layer/training_from_scratch/data/cifar-10-batches-py/readme.html
+*.json

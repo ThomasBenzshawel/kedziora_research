@@ -57,7 +57,6 @@ python3 batch_obja_download.py \
     --num-objects $OBJECTS_PER_JOB \
     --start-offset $START_OFFSET \
     --job-id $SLURM_ARRAY_TASK_ID \
-    --file-types glb \
     --temp-dir ~/objaverse_temp/job_$SLURM_ARRAY_TASK_ID \
     --batch-size 1000
 

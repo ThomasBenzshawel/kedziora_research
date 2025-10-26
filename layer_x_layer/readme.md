@@ -1,1 +1,0 @@
-sunet = the u net used for the auto encoder
