@@ -39,9 +39,44 @@ from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 from torch.utils.data.distributed import DistributedSampler
 from functools import partial
 
+import concurrent.futures
+from pathlib import Path
+import threading
+from functools import lru_cache
+import sqlite3
+
+from difflib import get_close_matches
+import logging
 
 granularity = 16  # number of layers to generate and also the resolution of the unet input and output
-
+def initialize_model_weights(model):
+    """
+    Initialize model weights properly before FSDP wrapping.
+    Critical for avoiding cuDNN errors with FSDP + mixed precision.
+    """
+    def init_weights(m):
+        if isinstance(m, nn.Conv2d):
+            # Use kaiming for conv layers
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Linear):
+            # Xavier for linear layers with small gain for stability
+            nn.init.xavier_uniform_(m.weight, gain=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, (nn.GroupNorm, nn.LayerNorm, nn.BatchNorm2d)):
+            # Standard normalization layer init
+            if hasattr(m, 'weight') and m.weight is not None:
+                nn.init.ones_(m.weight)
+            if hasattr(m, 'bias') and m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            # Small random values for embeddings
+            nn.init.normal_(m.weight, mean=0, std=0.02)
+    
+    model.apply(init_weights)
+    return model
 
 def parse_args():
     """Parse command line arguments for training configuration"""
@@ -55,7 +90,7 @@ def parse_args():
                         help='FSDP sharding strategy (default: FULL_SHARD for max memory savings)')
     parser.add_argument('--cpu_offload', action='store_true',
                         help='Offload parameters and gradients to CPU (saves GPU memory)')
-    parser.add_argument('--mixed_precision', action='store_true', default=True,
+    parser.add_argument('--mixed_precision', action='store_true', default=False,
                         help='Use mixed precision training (bfloat16 or float16)')
     
     # Training hyperparameters
@@ -189,60 +224,175 @@ def get_fsdp_config():
 
 # %%
 # ========== T5 EMBEDDING CACHE ==========
-class T5EmbeddingCache:
-    """Cache for pre-computed T5 embeddings to speed up training"""
+class T5EmbeddingCacheSQL:
+    """SQLite-based embedding cache for minimal memory footprint"""
     
-    def __init__(self, cache_dir='./t5_cache', max_length=77):
+    def __init__(self, cache_dir='./t5_cache', max_length=77, memory_cache_size=1000):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.max_length = max_length
-        self.cache = {}  # In-memory cache
-        self.cache_file = self.cache_dir / 'embeddings.pt'
+        self.db_path = self.cache_dir / 'embeddings.db'
+        self.memory_cache_size = memory_cache_size
         
+        # Small LRU cache for frequently accessed embeddings
+        self._memory_cache = {}
+        self._cache_order = []
+        self._init_db()
+    
+    def _init_db(self):
+        """Initialize SQLite database"""
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS embeddings (
+                text_hash TEXT PRIMARY KEY,
+                embedding BLOB
+            )
+        ''')
+        conn.commit()
+        conn.close()
+    
+    def load_cache(self):
+        """
+        Load cache from disk (no-op for SQLite since it's always persistent).
+        This method exists for API compatibility with the original cache.
+        """
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM embeddings')
+        count = cursor.fetchone()[0]
+        conn.close()
+        
+        if count > 0:
+            print(f"Found {count} cached embeddings in database")
+        else:
+            print("No existing cache found, will create new cache")
+    
+    def save_cache(self):
+        """
+        Save cache to disk (no-op for SQLite since writes are immediate).
+        This method exists for API compatibility with the original cache.
+        """
+        # SQLite commits are immediate, so nothing to do
+        # But we can count entries for informational purposes
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM embeddings')
+        count = cursor.fetchone()[0]
+        conn.close()
+        print(f"Database contains {count} cached embeddings")
+    
     def _get_cache_key(self, text):
         """Generate a unique key for a text description"""
         import hashlib
         return hashlib.md5(text.encode()).hexdigest()
     
-    def load_cache(self):
-        """Load cached embeddings from disk"""
-        if self.cache_file.exists():
-            print(f"Loading T5 embedding cache from {self.cache_file}...")
-            self.cache = torch.load(self.cache_file)
-            print(f"Loaded {len(self.cache)} cached embeddings")
-        else:
-            print("No existing cache found, will create new cache")
-    
-    def save_cache(self):
-        """Save cached embeddings to disk"""
-        torch.save(self.cache, self.cache_file)
-        print(f"Saved {len(self.cache)} embeddings to cache")
-    
     def get_embedding(self, text):
-        """Get embedding from cache"""
+        """Get embedding from cache (memory -> disk)"""
         key = self._get_cache_key(text)
-        return self.cache.get(key, None)
+        
+        # Check memory cache first
+        if key in self._memory_cache:
+            return self._memory_cache[key]
+        
+        # Check disk cache
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        cursor.execute('SELECT embedding FROM embeddings WHERE text_hash = ?', (key,))
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result is not None:
+            embedding = torch.from_numpy(
+                np.frombuffer(result[0], dtype=np.float16).reshape(self.max_length, 768)
+            )
+            
+            # Add to memory cache
+            self._add_to_memory_cache(key, embedding)
+            return embedding
+        
+        return None
+    
+    def _add_to_memory_cache(self, key, embedding):
+        """Add to memory cache with LRU eviction"""
+        if key in self._memory_cache:
+            self._cache_order.remove(key)
+        
+        self._memory_cache[key] = embedding
+        self._cache_order.append(key)
+        
+        # Evict oldest if cache is full
+        if len(self._memory_cache) > self.memory_cache_size:
+            oldest_key = self._cache_order.pop(0)
+            del self._memory_cache[oldest_key]
     
     def add_embedding(self, text, embedding):
-        """Add embedding to cache"""
+        """Add embedding to disk cache"""
         key = self._get_cache_key(text)
-        self.cache[key] = embedding.cpu()
+        embedding_bytes = embedding.cpu().numpy().astype(np.float16).tobytes()
+        
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO embeddings (text_hash, embedding)
+            VALUES (?, ?)
+        ''', (key, embedding_bytes))
+        conn.commit()
+        conn.close()
+        
+        # Also add to memory cache
+        self._add_to_memory_cache(key, embedding.cpu())
     
-    def precompute_embeddings(self, texts, tokenizer, model, device, batch_size=32):
+    def precompute_embeddings(self, dataloader_or_texts, tokenizer, model, device, batch_size=32):
         """
-        Precompute embeddings for a list of texts
+        Precompute embeddings and store in database (memory-efficient)
         
         Args:
-            texts: List of text descriptions
+            dataloader_or_texts: Either a DataLoader (from VoxelDataset) or a list of text strings
             tokenizer: T5 tokenizer
             model: T5 model
-            device: Device to run on
-            batch_size: Batch size for encoding
+            device: torch device
+            batch_size: Batch size for embedding computation (not DataLoader batch size)
         """
         from tqdm import tqdm
+        import torch
+        from torch.utils.data import DataLoader
+        
+        # Extract unique descriptions from DataLoader or use text list directly
+        if isinstance(dataloader_or_texts, DataLoader):
+            print("Extracting unique descriptions from DataLoader...")
+            unique_descriptions = set()
+            
+            for batch in tqdm(dataloader_or_texts, desc="Scanning descriptions"):
+                voxel_grids, descriptions = batch
+                
+                # Immediately discard voxel data to save memory
+                del voxel_grids
+                
+                # Add descriptions to set (handles duplicates automatically)
+                if isinstance(descriptions, (list, tuple)):
+                    unique_descriptions.update(descriptions)
+                else:
+                    # Single description
+                    unique_descriptions.add(descriptions)
+                
+                # Clear cache periodically
+                if torch.cuda.is_available() and len(unique_descriptions) % 1000 == 0:
+                    torch.cuda.empty_cache()
+            
+            texts = list(unique_descriptions)
+            print(f"Found {len(texts)} unique descriptions from DataLoader")
+        else:
+            # Assume it's a list of texts
+            texts = dataloader_or_texts
+            print(f"Processing {len(texts)} descriptions from text list")
         
         # Find texts that aren't cached yet
-        uncached_texts = [t for t in texts if self.get_embedding(t) is None]
+        uncached_texts = []
+        print("Checking cache for existing embeddings...")
+        for t in tqdm(texts, desc="Cache check"):
+            if self.get_embedding(t) is None:
+                uncached_texts.append(t)
         
         if not uncached_texts:
             print("All embeddings already cached!")
@@ -255,6 +405,7 @@ class T5EmbeddingCache:
             for i in tqdm(range(0, len(uncached_texts), batch_size), desc="Caching embeddings"):
                 batch_texts = uncached_texts[i:i+batch_size]
                 
+                # Tokenize
                 text_inputs = tokenizer(
                     batch_texts,
                     padding='max_length',
@@ -263,24 +414,32 @@ class T5EmbeddingCache:
                     return_tensors='pt'
                 ).to(device)
                 
+                # Compute embeddings
                 embeddings = model(
                     input_ids=text_inputs.input_ids,
                     attention_mask=text_inputs.attention_mask
-                ).last_hidden_state  # [B, seq_len, 768]
+                ).last_hidden_state
                 
-                # Add each embedding to cache
+                # Immediately process and store each embedding (moves to CPU in add_embedding)
                 for text, emb in zip(batch_texts, embeddings):
                     self.add_embedding(text, emb)
+                
+                # Explicitly delete GPU tensors
+                del text_inputs
+                del embeddings
+                
+                # Clear CUDA cache every 10 batches to prevent fragmentation
+                if torch.cuda.is_available() and (i // batch_size) % 10 == 0:
+                    torch.cuda.empty_cache()
         
-        self.save_cache()
-    
+        # Final cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        self.save_cache()  # Print count
+        
     def get_batch_embeddings(self, texts, device):
-        """
-        Get embeddings for a batch of texts from cache
-        
-        Returns:
-            Tensor of shape [B, seq_len, hidden_dim]
-        """
+        """Get batch of embeddings from cache"""
         embeddings = []
         for text in texts:
             emb = self.get_embedding(text)
@@ -288,8 +447,12 @@ class T5EmbeddingCache:
                 raise ValueError(f"Embedding not found in cache for text: {text[:50]}...")
             embeddings.append(emb)
         
-        return torch.stack(embeddings).to(device)
-
+        if is_distributed:
+            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        else:
+            dtype = torch.float16
+        
+        return torch.stack(embeddings).to(device, dtype=dtype)
 
 # %%
 # ========== VALIDATION METRICS ==========
@@ -354,16 +517,6 @@ class ValidationMetrics:
         
         return metrics
 
-# %% [markdown]
-# # Diffusion Model
-# A model that generates layers of a voxelized 3D model one layer at a time through defusion.
-# 
-# The general idea of this is to do diffusion twice.
-# 
-# The first diffusion is done for each layer. Each layer goes through all diffusion time steps, and is combined at the end to be a 3D object.
-# 
-# This is done for x granularities of voxels, where each previous granularity informs the current granularity level.
-
 # %%
 class MultiHeadSelfAttention(nn.Module):
     def __init__(self, channels, num_heads=8, dropout=0.2):
@@ -413,79 +566,6 @@ class MultiHeadSelfAttention(nn.Module):
         out = self.proj(out)
         return x + out
     
-
-# %%
-class MultiHeadCrossAttentionV1(nn.Module):
-    """
-    A more standard implementation where context is properly projected 
-    and can attend to multiple positions
-    """
-    def __init__(self, channels, context_dim, num_heads=8, context_tokens=8):
-        super().__init__()
-        self.channels = channels
-        self.context_dim = context_dim
-        self.num_heads = num_heads
-        self.head_dim = channels // num_heads
-        self.context_tokens = context_tokens
-
-        self.norm = nn.GroupNorm(min(8, channels), channels)
-        self.q = nn.Conv2d(channels, channels, 1)
-
-        # Project context to key and value
-        self.context_mlp_proj = nn.Sequential(
-            nn.Linear(context_dim, context_dim * 2),
-            nn.GELU(),
-            nn.Linear(context_dim * 2, channels * self.context_tokens * 2)
-        )
-        
-        # Final projection
-        self.proj = nn.Conv2d(channels, channels, 1)
-
-        self.context_pos_emb = nn.Parameter(
-            torch.randn(1, self.context_tokens, channels) * 0.02
-        )
-        
-
-        
-    def forward(self, x, context):
-        B, C, H, W = x.shape
-        
-        # Normalize spatial features
-        h = self.norm(x)
-        
-        # Query from spatial features
-        q = self.q(h)  # [B, C, H, W]
-        q = q.view(B, self.num_heads, self.head_dim, H * W)
-        q = q.permute(0, 1, 3, 2)  # [B, heads, HW, head_dim]
-        
-        # Project context to key and value
-        context_proj = self.context_mlp_proj(context)  # [B, channels * context_tokens * 2]
-        context_proj = context_proj.view(B, self.context_tokens, 2, self.channels)
-
-        context_proj[:, :, 1] += self.context_pos_emb  # Add to V only  
-        k, v = context_proj[:, :, 0], context_proj[:, :, 1]  # Each is [B, context_tokens, channels]
-        
-        # Add sequence dimension to k and v
-        k = k.view(B, self.context_tokens, self.num_heads, self.head_dim)
-        v = v.view(B, self.context_tokens, self.num_heads, self.head_dim)
-        k = k.permute(0, 2, 1, 3)  # [B, heads, num_tokens, head_dim]
-        v = v.permute(0, 2, 1, 3)  # [B, heads, num_tokens, head_dim]
-
-        # Compute attention scores
-        scale = self.head_dim ** -0.5
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, heads, HW, 1]
-        attn = F.softmax(scores, dim=-1)
-        
-        # Apply attention 
-        out = torch.matmul(attn, v)
-        
-        # Reshape back to spatial dimensions
-        out = out.permute(0, 1, 3, 2).contiguous()  # [B, heads, head_dim, HW]
-        out = out.view(B, C, H, W)
-        
-        # Final projection and residual
-        out = self.proj(out)
-        return x + out
 
 # %%
 class MultiHeadCrossAttention(nn.Module):
@@ -571,54 +651,42 @@ class TransformerBlock(nn.Module):
         x = self.cross_attn(x, context)
         return x + self.ffn(x)
 
-
-
-# %%
-
-# Using sinusoidal positional embeddings for time steps
-class SinusoidalPosEmb(nn.Module):
-    def __init__(self, dim):
+class AdaGN(nn.Module):
+    def __init__(self, num_groups, num_channels, cond_channels):
         super().__init__()
-        self.dim = dim
-
-    def forward(self, x):
-        device = x.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
-        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
-        if self.dim % 2 == 1:  # zero pad
-            emb = F.pad(emb, (0,1,0,0))
-        return emb
+        self.num_groups = num_groups
+        self.norm = nn.GroupNorm(num_groups, num_channels, affine=False)
+        self.scale_shift = nn.Linear(cond_channels, num_channels * 2)
+    
+    def forward(self, x, cond):
+        x = self.norm(x)
+        scale, shift = self.scale_shift(cond).chunk(2, dim=-1)
+        return x * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
 
 
-# Enhanced ResNet Block with optional attention
+# Enhanced ResNet Block with optional attention and adaGN conditioning
 class ResnetBlockWithAttention(nn.Module):
-    def __init__(self, in_channels, out_channels, time_emb_dim, context_dim, layer_context_dim = 64, 
-    use_attention=False, num_heads=8):
+    def __init__(self, in_channels, out_channels, time_emb_dim, context_dim, 
+                 layer_context_dim=64, use_attention=False, num_heads=8, num_groups=8):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
-        self.norm1 = nn.GroupNorm(8, out_channels)
-
-        self.time_mlp = nn.Linear(time_emb_dim, out_channels)
         
+        # Combined conditioning dimension (time + layer context)
+        cond_dim = time_emb_dim + layer_context_dim
+        
+        # AdaGN layers that condition on BOTH time and layer
+        self.norm1 = AdaGN(num_groups, in_channels, cond_dim)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        
+        self.norm2 = AdaGN(num_groups, out_channels, cond_dim)
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
-        self.norm2 = nn.GroupNorm(8, out_channels)
-
-        self.layer_mlp = nn.Sequential(
-            nn.Linear(layer_context_dim, out_channels),
-            nn.SiLU(),
-            nn.Linear(out_channels, out_channels)
-        ) 
-
+        
         self.activation = nn.SiLU()
         
         # Add transformer block if specified
         self.use_attention = use_attention
         if use_attention:
             self.attention = TransformerBlock(out_channels, context_dim, num_heads=num_heads)
-
+        
         # Shortcut connection
         if in_channels != out_channels:
             self.shortcut = nn.Conv2d(in_channels, out_channels, 1)
@@ -626,126 +694,55 @@ class ResnetBlockWithAttention(nn.Module):
             self.shortcut = nn.Identity()
     
     def forward(self, x, t, context_emb, layer_context=None):
-        h = self.conv1(x)
-        h = self.norm1(h)
-        h = self.activation(h)
-        
-        # Add time embedding
-        h += self.time_mlp(t)[:, :, None, None]
-
-        # Add layer context if provided
+        """
+        x: [B, in_channels, H, W]
+        t: [B, time_emb_dim] - time embedding
+        context_emb: [B, seq_len, context_dim] - text/context embeddings for attention
+        layer_context: [B, layer_context_dim] - layer positional embedding (optional)
+        """
+        # Combine time and layer context for conditioning
         if layer_context is not None:
-            h += self.layer_mlp(layer_context)[:, :, None, None]
-
+            cond = torch.cat([t, layer_context], dim=-1)  # [B, time_emb_dim + layer_context_dim]
+        else:
+            # If no layer context, pad with zeros
+            layer_zeros = torch.zeros(t.shape[0], self.norm1.scale_shift.in_features - t.shape[1], 
+                                     device=t.device, dtype=t.dtype)
+            cond = torch.cat([t, layer_zeros], dim=-1)
+        
+        # First ResNet block: norm -> activation -> conv
+        h = self.norm1(x, cond)
+        h = self.activation(h)
+        h = self.conv1(h)
+        
+        # Second ResNet block: norm -> activation -> conv
+        h = self.norm2(h, cond)
         h = self.activation(h)
         h = self.conv2(h)
-        h = self.norm2(h)
-        h = self.activation(h)
         
         # Apply attention if enabled
         if self.use_attention:
-            h = self.attention(h, context_emb) # eventually add layer_context here too
+            h = self.attention(h, context_emb)
         
+        # Add skip connection
         return h + self.shortcut(x)
 
 
-class UNet(nn.Module):
-    def __init__(self, in_channels=1, model_channels=128, context_dim=512, 
-                 attention_resolutions=[8, 16]):
-        """
-        attention_resolutions: list of resolutions (H, W) where attention should be applied
-        For 32x32 images: resolution 16 means we apply attention at 16x16 feature maps
-        """
+class SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim):
         super().__init__()
-        self.model_channels = model_channels
-        self.attention_resolutions = attention_resolutions
-        
-        # Time embedding
-        time_embed_dim = model_channels * 4
-        self.time_embed = nn.Sequential(
-            SinusoidalPosEmb(model_channels),
-            nn.Linear(model_channels, time_embed_dim),
-            nn.SiLU(),
-            nn.Linear(time_embed_dim, time_embed_dim),
-        )
+        self.dim = dim
 
-        # Input
-        self.input_conv = nn.Conv2d(in_channels, model_channels, 3, padding=1)
-        
-        # Down blocks with attention at specific resolutions
-        # For 32x32 input: 32 -> 16 -> 8
-        self.down_block1 = ResnetBlockWithAttention(
-            model_channels, model_channels * 2, time_embed_dim, context_dim,
-            use_attention=(32 in attention_resolutions)
-        )
-        self.down_block2 = ResnetBlockWithAttention(
-            model_channels * 2, model_channels * 4, time_embed_dim, context_dim,
-            use_attention=(16 in attention_resolutions)
-        )
-        self.down_block3 = ResnetBlockWithAttention(
-            model_channels * 4, model_channels * 4, time_embed_dim, context_dim,
-            use_attention=(8 in attention_resolutions)
-        )
-        
-        self.downsample1 = nn.MaxPool2d(2)
-        self.downsample2 = nn.MaxPool2d(2)
-        
-        # Middle block with attention (always at lowest resolution)
-        self.mid_block = ResnetBlockWithAttention(
-            model_channels * 4, model_channels * 4, time_embed_dim, context_dim,
-            use_attention=True
-        )
-        
-        # Up blocks with attention
-        self.up_block1 = ResnetBlockWithAttention(
-            model_channels * 4, model_channels * 4, time_embed_dim, context_dim,
-            use_attention=(8 in attention_resolutions)
-        )
-        self.up_block2 = ResnetBlockWithAttention(
-            model_channels * 4 + model_channels * 4, model_channels * 2, time_embed_dim, context_dim,
-            use_attention=(16 in attention_resolutions)
-        )
-        self.up_block3 = ResnetBlockWithAttention(
-            model_channels * 2 + model_channels * 2, model_channels, time_embed_dim, context_dim,
-            use_attention=(32 in attention_resolutions)
-        )
-        
-        self.upsample1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.upsample2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        
-        # Output
-        self.output_conv = nn.Conv2d(model_channels, in_channels, 3, padding=1)
-
-    def forward(self, x, t, context, layer_context=None):
-        # Time embedding
-        time_emb = self.time_embed(t)
-
-        # Input
-        h = self.input_conv(x)
-
-        # Downsampling with skip connections
-        h1 = self.down_block1(h, time_emb, context)
-        h = self.downsample1(h1)
-        h2 = self.down_block2(h, time_emb, context)
-        h = self.downsample2(h2)
-        h3 = self.down_block3(h, time_emb, context)
-
-        # Middle
-        h = self.mid_block(h3, time_emb, context)
-
-        # Upsampling with skip connections
-        h = self.up_block1(h, time_emb, context)
-        h = self.upsample1(h)
-        h = torch.cat([h, h2], dim=1)
-        h = self.up_block2(h, time_emb, context)
-        h = self.upsample2(h)
-        h = torch.cat([h, h1], dim=1)
-        h = self.up_block3(h, time_emb, context)
-
-        # Output
-        return self.output_conv(h)
-
-
+    def forward(self, x):
+        device = x.device
+        dtype = x.dtype  
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device, dtype=dtype) * -emb)
+        emb = x[:, None] * emb[None, :]
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+        if self.dim % 2 == 1:  # zero pad
+            emb = F.pad(emb, (0,1,0,0))
+        return emb
 
 class ExponentialMovingAverage:
     def __init__(self, model, decay=0.999):
@@ -853,10 +850,14 @@ class ForwardDiffusion():
         
         return betas
 
-    def forward(self, x0, t, noise=None):
+    def forward(self, x0, t, noise=None, dtype=torch.float32):
         if noise is None:
-            noise = torch.randn_like(x0)
-        
+            if is_distributed:
+                dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            else:
+                dtype = torch.float16
+            noise = torch.randn_like(x0).to(dtype=dtype)
+
         sqrt_alpha_hat = self.sqrt_alpha_hats[t].view(-1, 1, 1, 1).to(x0.device)
         sqrt_one_minus_alpha_hat = self.sqrt_one_minus_alpha_hats[t].view(-1, 1, 1, 1).to(x0.device)
         
@@ -872,143 +873,41 @@ class ForwardDiffusion():
             alpha_hat_t_minus_1 = self.alpha_hats[t - 1]
             return self.betas[t] * (1 - alpha_hat_t_minus_1) / (1 - alpha_hat_t)
 
-# %%
-class ExponentialMovingAverage:
-    def __init__(self, model, decay=0.999):
-        self.model = model
-        self.decay = decay
-        self.shadow = {}
-        self.backup = {}
-
-        # Initialize shadow weights
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
-
-    def update(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                assert name in self.shadow
-                new_average = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
-                self.shadow[name] = new_average.clone()
-
-    def apply_shadow(self):
-        # Backup current parameters
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                self.backup[name] = param.data.clone()
-
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                assert name in self.shadow
-                param.data = self.shadow[name]
-
-    def restore(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                assert name in self.backup
-                param.data = self.backup[name]
-        self.backup = {}
-
-# %%
-class CrossAttentionBlock(nn.Module):
-    """
-    Cross-attention block that attends from spatial features to a context vector.
-    """
-    def __init__(self, channels, context_dim, num_heads=8, dropout=0.0):
+class RelativePositionBias(nn.Module):
+    def __init__(self, num_heads, max_distance=32):
         super().__init__()
-        self.channels = channels
-        self.context_dim = context_dim
         self.num_heads = num_heads
-        self.head_dim = channels // num_heads
+        self.max_distance = max_distance
+        # +1 for exactly max_distance away
+        self.embeddings = nn.Embedding(2 * max_distance + 1, num_heads)
+    
+    def forward(self, N):
+        """
+        N: number of previous layers
+        Returns: [num_heads, N, N] bias matrix
+        """
+        device = self.embeddings.weight.device
+        positions = torch.arange(N, device=device)
         
-        assert channels % num_heads == 0, f"channels {channels} must be divisible by num_heads {num_heads}"
-        
-        # Normalization
-        num_groups = min(8, channels)
-        while channels % num_groups != 0:
-            num_groups -= 1
-        self.norm = nn.GroupNorm(num_groups, channels)
-        
-        # Query from spatial features
-        self.to_q = nn.Conv2d(channels, channels, 1)
-        
-        # Key and Value from context
-        self.to_kv = nn.Linear(context_dim, channels * 2)
-        
-        # Output projection
-        self.to_out = nn.Sequential(
-            nn.Conv2d(channels, channels, 1),
-            nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        # Relative positions: how far is layer j from layer i
+        relative_positions = positions[None, :] - positions[:, None]  # [N, N]
+        relative_positions = torch.clamp(
+            relative_positions, 
+            -self.max_distance, 
+            self.max_distance
         )
+        relative_positions = relative_positions + self.max_distance
         
-    def forward(self, x, context):
-        """
-        x: [B, C, H, W] - spatial features
-        context: [B, context_dim] - context vector
-        """
-        B, C, H, W = x.shape
-        
-        # Normalize spatial features
-        h = self.norm(x)
-        
-        # Get queries from spatial features
-        q = self.to_q(h)  # [B, C, H, W]
-        q = q.view(B, self.num_heads, self.head_dim, H * W)
-        q = q.permute(0, 1, 3, 2)  # [B, num_heads, HW, head_dim]
-        
-        # Get keys and values from context
-        kv = self.to_kv(context)  # [B, channels * 2]
-        kv = kv.view(B, 2, self.num_heads, self.head_dim)
-        k, v = kv[:, 0], kv[:, 1]  # Each is [B, num_heads, head_dim]
-        
-        # Add sequence dimension (since context is just one vector)
-        k = k.unsqueeze(2)  # [B, num_heads, 1, head_dim]
-        v = v.unsqueeze(2)  # [B, num_heads, 1, head_dim]
-        
-        # Compute attention
-        scale = self.head_dim ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, num_heads, HW, 1]
-        attn = F.softmax(attn, dim=-1)
-        
-        # Apply attention to values
-        out = torch.matmul(attn, v)  # [B, num_heads, HW, head_dim]
-        
-        # Reshape back to spatial
-        out = out.permute(0, 1, 3, 2).contiguous()  # [B, num_heads, head_dim, HW]
-        out = out.view(B, C, H, W)
-        
-        # Output projection and residual
-        out = self.to_out(out)
-        return x + out
-
-"""
-Enhanced Layer-by-Layer 3D Voxel Generation with Full Cross-Attention
-Drop-in replacement for your existing LayerXLayerDiffusionModel and trainer.
-
-USAGE:
-    1. Add this file to your project directory
-    2. Import: from layerwise_enhanced import LayerXLayerDiffusionModelV2, LayerXLayerDiffusionTrainerV2
-    3. Replace model and trainer initialization (see line 2037 and 2062 in your script)
-
-COMPATIBILITY:
-    - Works with FSDP (no changes needed)
-    - Works with EMA (no changes needed)
-    - Works with your existing T5 embeddings
-    - Works with your existing UNet and ForwardDiffusion classes
-"""
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from tqdm import tqdm
+        # Get embeddings and transpose to [num_heads, N, N]
+        bias = self.embeddings(relative_positions)  # [N, N, num_heads]
+        return bias.permute(2, 0, 1)  # [num_heads, N, N]
 
 
 class MultiLayerCrossAttentionBlock(nn.Module):
     """
     Cross-attention block that attends from current layer to ALL previous layers.
     """
-    def __init__(self, channels, layer_context_dim, num_heads=8, dropout=0.0):
+    def __init__(self, channels, layer_context_dim, num_heads=8, dropout=0.0, max_distance=32):
         super().__init__()
         self.channels = channels
         self.layer_context_dim = layer_context_dim
@@ -1032,17 +931,24 @@ class MultiLayerCrossAttentionBlock(nn.Module):
         # Layer positional encoding projection
         self.layer_pos_proj = nn.Linear(layer_context_dim, channels)
         
+        # Relative position bias for layer-to-layer attention
+        self.relative_position_bias = RelativePositionBias(
+            num_heads=num_heads,
+            max_distance=max_distance
+        )
+        
         # Output projection
         self.to_out = nn.Sequential(
             nn.Conv2d(channels, channels, 1),
             nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         )
         
-    def forward(self, x, prev_layers, layer_positions):
+    def forward(self, x, prev_layers, layer_positions, current_layer_idx=None):
         """
         x: [B, C, H, W] - current layer features
         prev_layers: [B, N, C, H, W] - all previous layer features
         layer_positions: [B, N, layer_context_dim] - positional encodings
+        current_layer_idx: Tensor [B] - index of current layer (for relative bias)
         """
         B, C, H, W = x.shape
         N = prev_layers.shape[1] if prev_layers is not None and prev_layers.numel() > 0 else 0
@@ -1081,7 +987,38 @@ class MultiLayerCrossAttentionBlock(nn.Module):
         
         # Compute attention
         scale = self.head_dim ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, num_heads, HW, N*HW]
+        
+        # Add relative position bias
+        if current_layer_idx is not None:
+            device = attn.device
+            
+            # Previous layer indices: [0, 1, 2, ..., N-1]
+            prev_indices = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)  # [B, N]
+            
+            # Compute relative distances from current layer to each previous layer
+            relative_distances = current_layer_idx.unsqueeze(1) - prev_indices  # [B, N]
+            relative_distances = torch.clamp(
+                relative_distances, 
+                -self.relative_position_bias.max_distance, 
+                self.relative_position_bias.max_distance
+            )
+            relative_distances = relative_distances + self.relative_position_bias.max_distance
+            
+            # Get bias: [B, N, num_heads]
+            bias = self.relative_position_bias.embeddings(relative_distances)
+            bias = bias.permute(0, 2, 1)  # [B, num_heads, N]
+            
+            # Reshape bias to match attention shape: [B, num_heads, HW, N*HW]
+            # Each spatial position gets the same layer-level bias
+            bias = bias.unsqueeze(2)  # [B, num_heads, 1, N]
+            bias = bias.repeat(1, 1, H * W, 1)  # [B, num_heads, HW, N]
+            bias = bias.unsqueeze(-1).expand(-1, -1, -1, -1, H * W)  # [B, num_heads, HW, N, HW]
+            bias = bias.reshape(B, self.num_heads, H * W, N * H * W)  # [B, num_heads, HW, N*HW]
+            
+            # Add bias to attention scores
+            attn = attn + bias
+        
         attn = F.softmax(attn, dim=-1)
         
         # Apply attention to values
@@ -1098,11 +1035,11 @@ class LayerXLayerDiffusionModelV2(nn.Module):
     Enhanced version with cross-attention to ALL previous layers.
     Drop-in replacement for LayerXLayerDiffusionModel.
     """
-    def __init__(self, base_model, layer_context_dim=64, granularity=128, 
-                 text_context_dim=768, max_context_layers=None):
+    def __init__(self, layer_context_dim=64, granularity=128,
+                 text_context_dim=768, max_context_layers=None, in_channels=1, model_channels=128, context_dim=512,
+                 attention_resolutions=[8, 16]):
         """
         Args:
-            base_model: UNet model
             layer_context_dim: Dimension of layer context embeddings
             granularity: Number of layers in 3D volume
             text_context_dim: Dimension of text embeddings (768 for T5-base)
@@ -1111,11 +1048,12 @@ class LayerXLayerDiffusionModelV2(nn.Module):
                                16-32 = recommended for balance
         """
         super().__init__()
-        self.base_model = base_model
         self.layer_context_dim = layer_context_dim
         self.granularity = granularity
         self.text_context_dim = text_context_dim
         self.max_context_layers = max_context_layers
+        self.model_channels = model_channels
+        self.attention_resolutions = attention_resolutions
         
         # Positional encoding for layer indices
         self.layer_pos_emb = SinusoidalPosEmb(layer_context_dim)
@@ -1124,23 +1062,80 @@ class LayerXLayerDiffusionModelV2(nn.Module):
         self.layer_context_conditioning_mlp = nn.Sequential(
             nn.Linear(layer_context_dim + text_context_dim, layer_context_dim * 2),
             nn.GELU(),
-            nn.Linear(layer_context_dim * 2, layer_context_dim)
+            nn.Linear(layer_context_dim * 2, text_context_dim)
         )
         
         # Multi-layer cross-attention
         self.multi_layer_cross_attn = MultiLayerCrossAttentionBlock(
-            channels=base_model.model_channels,
+            channels=self.model_channels,
             layer_context_dim=layer_context_dim,
-            num_heads=8
+            num_heads=8,
+            max_distance=32  # Can adjust this based on your typical layer distances
         )
         
         # Encoder for previous layers
         self.prev_layer_encoder = nn.Sequential(
-            nn.Conv2d(1, base_model.model_channels // 2, 3, padding=1),
-            nn.GroupNorm(8, base_model.model_channels // 2),
+            nn.Conv2d(1, self.model_channels // 2, 3, padding=1),
+            nn.GroupNorm(8, self.model_channels // 2),
             nn.SiLU(),
-            nn.Conv2d(base_model.model_channels // 2, base_model.model_channels, 3, padding=1),
+            nn.Conv2d(self.model_channels // 2, self.model_channels, 3, padding=1),
         )
+        
+        # Time embedding
+        time_embed_dim = model_channels * 4
+        self.time_embed = nn.Sequential(
+            SinusoidalPosEmb(model_channels),
+            nn.Linear(model_channels, time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(time_embed_dim, time_embed_dim),
+        )
+
+        # Input
+        self.input_conv = nn.Conv2d(in_channels, model_channels, 3, padding=1)
+        
+        # Down blocks with attention at specific resolutions
+        # For 32x32 input: 32 -> 16 -> 8
+        self.down_block1 = ResnetBlockWithAttention(
+            model_channels, model_channels * 2, time_embed_dim, context_dim,
+            use_attention=(32 in attention_resolutions)
+        )
+        self.down_block2 = ResnetBlockWithAttention(
+            model_channels * 2, model_channels * 4, time_embed_dim, context_dim,
+            use_attention=(16 in attention_resolutions)
+        )
+        self.down_block3 = ResnetBlockWithAttention(
+            model_channels * 4, model_channels * 4, time_embed_dim, context_dim,
+            use_attention=(8 in attention_resolutions)
+        )
+        
+        self.downsample1 = nn.MaxPool2d(2)
+        self.downsample2 = nn.MaxPool2d(2)
+        
+        # Middle block with attention (always at lowest resolution)
+        self.mid_block = ResnetBlockWithAttention(
+            model_channels * 4, model_channels * 4, time_embed_dim, context_dim,
+            use_attention=True
+        )
+        
+        # Up blocks with attention
+        self.up_block1 = ResnetBlockWithAttention(
+            model_channels * 4, model_channels * 4, time_embed_dim, context_dim,
+            use_attention=(8 in attention_resolutions)
+        )
+        self.up_block2 = ResnetBlockWithAttention(
+            model_channels * 4 + model_channels * 4, model_channels * 2, time_embed_dim, context_dim,
+            use_attention=(16 in attention_resolutions)
+        )
+        self.up_block3 = ResnetBlockWithAttention(
+            model_channels * 2 + model_channels * 2, model_channels, time_embed_dim, context_dim,
+            use_attention=(32 in attention_resolutions)
+        )
+        
+        self.upsample1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.upsample2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        
+        # Output
+        self.output_conv = nn.Conv2d(model_channels, in_channels, 3, padding=1)
 
     def forward(self, x, t, l, context, prev_layers=None):
         """
@@ -1157,21 +1152,35 @@ class LayerXLayerDiffusionModelV2(nn.Module):
             predicted_noise: [B, C, H, W]
         """
         B = x.shape[0]
-        
+
+        # get model parameter dtype
+        model_dtype = next(self.parameters()).dtype             
         # Create layer position embedding
-        layer_pos = self.layer_pos_emb(l.float())
-        
+
+        l = l.to(model_dtype)
+        layer_pos = self.layer_pos_emb(l)  # [B, layer_context_dim]
+        # Ensure layer_pos is in the same dtype as the model
+        layer_pos = layer_pos.to(model_dtype)
+        context = context.to(model_dtype)
+        t = t.to(model_dtype)
+        x = x.to(model_dtype)
+        prev_layers = prev_layers.to(model_dtype) if prev_layers is not None else None
+
         # reshape the layer position to be [B, 1, layer_context_dim]
-        layer_pos = layer_pos.unsqueeze(1)                
+        layer_pos_expanded = layer_pos.unsqueeze(1)  # [B, 1, layer_context_dim]
 
         # Expand layer_pos to match context's sequence length
         seq_len = context.shape[1]  
-        layer_pos = layer_pos.expand(-1, seq_len, -1)  # [B, sequence, layer_context_dim]
+        layer_pos_expanded = layer_pos_expanded.expand(-1, seq_len, -1)  # [B, sequence, layer_context_dim]
 
-        # Now concatenate along the feature dimension
-        layer_ctx_input = torch.cat([layer_pos, context], dim=-1)  # [B, 77, layer_context_dim + text_context_dim]
-        layer_ctx = self.layer_context_conditioning_mlp(layer_ctx_input)
-        
+        # Combine layer position and text context
+        combined_context = torch.cat([layer_pos_expanded, context], dim=-1)  # [B, sequence, layer_context_dim + text_context_dim]
+        # Process combined context through MLP
+        context = self.layer_context_conditioning_mlp(combined_context)  # [B, sequence, text_context_dim]
+
+        # Get features through input conv
+        h = self.input_conv(x)
+
         # Process previous layers if they exist
         if prev_layers is not None and prev_layers.numel() > 0:
             # Apply sliding window if specified
@@ -1188,37 +1197,35 @@ class LayerXLayerDiffusionModelV2(nn.Module):
                                               prev_features.shape[2], prev_features.shape[3])
             
             # Create positional encodings for all previous layers
-            layer_indices = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1)  # [B, N]
+            layer_indices = torch.arange(N, device=x.device, dtype=model_dtype).unsqueeze(0).expand(B, -1)  # [B, N]
             layer_indices_flat = layer_indices.reshape(-1)  # [B*N] - flatten to 1D
-            layer_positions = self.layer_pos_emb(layer_indices_flat.float())  # [B*N, layer_context_dim]
+            layer_positions = self.layer_pos_emb(layer_indices_flat)  # [B*N, layer_context_dim]
             layer_positions = layer_positions.view(B, N, -1)  # [B, N, layer_context_dim] - reshape back
+        
+            # Convert l to long for indexing
+            current_layer_idx = l.long()
             
-            # Get features through input conv
-            h = self.base_model.input_conv(x)
+            # Apply multi-layer cross-attention with relative position bias
+            h = self.multi_layer_cross_attn(h, prev_features, layer_positions, current_layer_idx)
             
-            # Apply multi-layer cross-attention
-            h = self.multi_layer_cross_attn(h, prev_features, layer_positions)
+        # Continue through UNet
+        time_emb = self.time_embed(t)
+        h1 = self.down_block1(h, time_emb, context)
+        h = self.downsample1(h1)
+        h2 = self.down_block2(h, time_emb, context)
+        h = self.downsample2(h2)
+        h3 = self.down_block3(h, time_emb, context)
+        h = self.mid_block(h3, time_emb, context)
+        h = self.up_block1(h, time_emb, context)
+        h = self.upsample1(h)
+        h = torch.cat([h, h2], dim=1)
+        h = self.up_block2(h, time_emb, context)
+        h = self.upsample2(h)
+        h = torch.cat([h, h1], dim=1)
+        h = self.up_block3(h, time_emb, context)
+        
+        return self.output_conv(h)
             
-            # Continue through UNet
-            time_emb = self.base_model.time_embed(t)
-            h1 = self.base_model.down_block1(h, time_emb, context)
-            h = self.base_model.downsample1(h1)
-            h2 = self.base_model.down_block2(h, time_emb, context)
-            h = self.base_model.downsample2(h2)
-            h3 = self.base_model.down_block3(h, time_emb, context)
-            h = self.base_model.mid_block(h3, time_emb, context)
-            h = self.base_model.up_block1(h, time_emb, context)
-            h = self.base_model.upsample1(h)
-            h = torch.cat([h, h2], dim=1)
-            h = self.base_model.up_block2(h, time_emb, context)
-            h = self.base_model.upsample2(h)
-            h = torch.cat([h, h1], dim=1)
-            h = self.base_model.up_block3(h, time_emb, context)
-            
-            return self.base_model.output_conv(h)
-        else:
-            # First layer - no previous layers
-            return self.base_model(x, t, context)
 
 # %% [markdown]
 # # create the 3d voxel dataset 
@@ -1226,97 +1233,111 @@ class LayerXLayerDiffusionModelV2(nn.Module):
 # the user will make a voxel dataset object for each granularity they want to train on
 
 # %%
-import concurrent.futures
-from pathlib import Path
-import threading
 
 class VoxelDataset(Dataset):
     def __init__(self, npy_folder_path, description_folder_path, transform=None, granularity=128, test_count=0):
-        self.npy_folder_path = npy_folder_path
-        self.description_folder_path = description_folder_path
+        self.npy_folder_path = Path(npy_folder_path)
+        self.description_folder_path = Path(description_folder_path)
         self.transform = transform
         self.granularity = granularity
-       
+        self.default_description = "A 3D object"
+        
+        # Track description misses for debugging
+        self.description_misses = {}  
+        
         print("Loading file lists...")
-        npy_path = Path(npy_folder_path)
-        # Limit dataset size for testing
+        
+        # Only store file paths (minimal memory)
         if test_count is not None and test_count > 0:
             file_list = []
             for entry in os.scandir(npy_folder_path):
                 if entry.name.endswith('.npy') and entry.is_file():
-                    file_list.append(npy_path / entry.name)
+                    file_list.append(self.npy_folder_path / entry.name)
                     if len(file_list) >= test_count:
                         break
-            print(f" TEST MODE: Using only {len(file_list)} samples")
+            print(f"TEST MODE: Using only {len(file_list)} samples")
         else:
             file_list = [
-            npy_path / entry.name
-            for entry in os.scandir(npy_folder_path)
-            if entry.name.endswith('.npy') and entry.is_file()
-        ]
-        self.file_list = file_list
-        print(f"Loading {len(self.file_list)} descriptions in parallel...")
-        # Parallel description loading (only for files we're using)
-        self.descriptions = self._load_descriptions_parallel()
+                self.npy_folder_path / entry.name
+                for entry in os.scandir(npy_folder_path)
+                if entry.name.endswith('.npy') and entry.is_file()
+            ]
         
-        # Fill missing descriptions with default
-        self._fill_missing_descriptions()
-       
-        print(f"Found {len(self.file_list)} .npy files in {npy_folder_path}")
-        print(f"Found {len(self.descriptions)} descriptions in {description_folder_path}")
+        self.file_list = file_list
+        
+        # Cache available description filenames for matching
+        self.available_descriptions = set()
+        for entry in os.scandir(description_folder_path):
+            if entry.name.endswith('.txt') and entry.is_file():
+                self.available_descriptions.add(entry.name[:-4])  # Remove .txt extension
+        
+        print(f"Found {len(self.file_list)} .npy files")
+        print(f"Found {len(self.available_descriptions)} description files")
         print(f"Voxel grid granularity: {self.granularity}x{self.granularity}x{self.granularity}")
-   
-    def _load_descriptions_parallel(self):
-        """Load all description files in parallel"""
-        # Only load descriptions for files we're actually using
-        needed_stems = {f.stem for f in self.file_list}
-        desc_files = [f for f in Path(self.description_folder_path).glob("*.txt")
-                      if f.stem in needed_stems]
-        descriptions = {}
-       
-        def load_single_description(desc_file):
+    
+    @lru_cache(maxsize=10000)  # Cache recently accessed descriptions
+    def _load_description(self, filename_stem):
+        """Load a single description file on-demand with caching"""
+        desc_file = self.description_folder_path / f"{filename_stem}.txt"
+        
+        if desc_file.exists():
             try:
                 with open(desc_file, 'r') as f:
-                    return desc_file.stem, f.read().strip()
+                    return f.read().strip()
             except Exception as e:
                 print(f"Error loading {desc_file}: {e}")
-                return desc_file.stem, "A 3D object"  # fallback
-       
-        # Use ThreadPoolExecutor for I/O bound operations
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            results = executor.map(load_single_description, desc_files)
-            descriptions.update(results)
-       
-        return descriptions
+                return self.default_description
+        else:
+            # Log the miss with most likely match
+            closest_matches = get_close_matches(filename_stem, self.available_descriptions, n=1, cutoff=0.6)
+            closest_match = closest_matches[0] if closest_matches else "No close match found"
+            
+            miss_info = {
+                'missing': filename_stem,
+                'closest_match': closest_match
+            }
+            self.description_misses.append(miss_info)
+            
+            return self.default_description
     
-    def _fill_missing_descriptions(self):
-        """Fill in default descriptions for any files without a matching description"""
-        default_description = "A 3D object"
-        missing_count = 0
-        
-        for file_path in self.file_list:
-            filename_key = file_path.stem
-            if filename_key not in self.descriptions:
-                self.descriptions[filename_key] = default_description
-                missing_count += 1
-        
-        if missing_count > 0:
-            print(f"Filled {missing_count} missing descriptions with default: '{default_description}'")
-   
     def __len__(self):
         return len(self.file_list)
-   
+    
     def __getitem__(self, idx):
-        voxel_grid = np.load(self.file_list[idx]).astype(np.float32)  # shape (granularity, granularity, granularity)
-        assert voxel_grid.shape == (self.granularity, self.granularity, self.granularity), f"Voxel grid shape {voxel_grid.shape} does not match expected shape {(self.granularity, self.granularity, self.granularity)}"
-       
+        # Load voxel data (already on-demand)
+        voxel_grid = np.load(self.file_list[idx]).astype(np.float16)
+        assert voxel_grid.shape == (self.granularity, self.granularity, self.granularity)
+        
         if self.transform:
             voxel_grid = self.transform(voxel_grid)
-       
-        voxel_grid = torch.from_numpy(voxel_grid).unsqueeze(0)  # Add channel dimension -> shape (1, granularity, granularity, granularity)
+        
+        voxel_grid = torch.from_numpy(voxel_grid).unsqueeze(0)
+        
+        # Load description on-demand (cached)
         filename_key = self.file_list[idx].stem
-        description = self.descriptions[filename_key]  # No need for .get() since all keys are guaranteed to exist
+        description = self._load_description(filename_key)
+        
         return voxel_grid, description
+    
+    def save_miss_report(self, output_path="description_misses.txt"):
+        """Save a report of all description misses"""
+        if not self.description_misses:
+            print("No description misses to report!")
+            return
+        
+        with open(output_path, 'w') as f:
+            f.write(f"Description Misses Report\n")
+            f.write(f"Total misses: {len(self.description_misses)}\n")
+            f.write(f"{'='*80}\n\n")
+            
+            for miss in self.description_misses:
+                f.write(f"Missing: {miss['missing']}\n")
+                f.write(f"Closest match: {miss['closest_match']}\n")
+                f.write(f"{'-'*80}\n")
+        
+        print(f"Miss report saved to {output_path}")
+        print(f"Total misses: {len(self.description_misses)}")
+
 
 # %%
 # create a 3d difussion trainer for the layer x layer model
@@ -1326,7 +1347,7 @@ class LayerXLayerDiffusionTrainerV2:
     Enhanced trainer that accumulates ALL previous layers.
     Drop-in replacement for LayerXLayerDiffusionTrainer.
     """
-    def __init__(self, model, diffusion, scheduler, layer_by_layer_convergence=True, 
+    def __init__(self, model: LayerXLayerDiffusionModelV2, diffusion, scheduler, layer_by_layer_convergence=True, 
                  teacher_forcing=True, use_ddim=True, ddim_steps=50, ddim_eta=0.0):
         self.model = model
         self.diffusion = diffusion
@@ -1356,6 +1377,7 @@ class LayerXLayerDiffusionTrainerV2:
         batch_size = x0.size(0)
         device = x0.device
         total_loss = 0
+        dtype = next(self.model.parameters()).dtype
 
         # Accumulate all previous layers
         prev_layers_list = []
@@ -1369,9 +1391,9 @@ class LayerXLayerDiffusionTrainerV2:
 
             # Add noise
             xt, noise = self.diffusion.forward(current_layer, t)
-
+            
             # Layer index tensor
-            l = torch.full((batch_size,), layer_idx, device=device, dtype=torch.float32)
+            l = torch.full((batch_size,), layer_idx, device=device, dtype=dtype)
 
             # Stack all previous layers
             if len(prev_layers_list) > 0:
@@ -1380,10 +1402,10 @@ class LayerXLayerDiffusionTrainerV2:
                 prev_layers = None
 
             # Predict noise with cross-attention to ALL previous layers
-            predicted_noise = self.model(xt, t.float(), l, context, prev_layers)
+            predicted_noise = self.model(xt, t, l, context, prev_layers)
 
             # Compute loss
-            loss = F.mse_loss(predicted_noise, noise)
+            loss = F.mse_loss(predicted_noise.float(), noise.float())
             total_loss += loss.detach()
             loss.backward()
 
@@ -1417,16 +1439,21 @@ class LayerXLayerDiffusionTrainerV2:
         Generate samples with layer-by-layer convergence and full cross-attention.
         """
         self.model.eval()
+        # set up master dtype
+        model_dtype = next(self.model.parameters()).dtype
         with torch.no_grad():
             batch_size = shape[0]
             voxel_grid = torch.zeros((batch_size, shape[1], shape[2], shape[3], 
-                                     self.model.granularity), device=device)
-            
+                                     self.model.granularity), device=device, dtype=model_dtype)
+
+            # Ensure all tensors are in the correct dtype
+            voxel_grid = voxel_grid.to(dtype=model_dtype)
+
             generated_layers = []
 
             for layer_idx in range(self.model.granularity):
-                l = torch.full((batch_size,), layer_idx, device=device, dtype=torch.float32)
-                x = torch.randn(shape, device=device)
+                l = torch.full((batch_size,), layer_idx, device=device, dtype=model_dtype)
+                x = torch.randn(shape, device=device, dtype=model_dtype)
 
                 # Stack all previously generated layers
                 if len(generated_layers) > 0:
@@ -1436,7 +1463,7 @@ class LayerXLayerDiffusionTrainerV2:
 
                 # Run diffusion to convergence
                 for t in reversed(range(self.diffusion.timesteps)):
-                    t_batch = torch.full((batch_size,), t, device=device, dtype=torch.float32)
+                    t_batch = torch.full((batch_size,), t, device=device, dtype=model_dtype)
                     predicted_noise = self.model(x, t_batch, l, context, prev_layers)
 
                     alpha_t = self.diffusion.alphas[t]
@@ -1460,11 +1487,12 @@ class LayerXLayerDiffusionTrainerV2:
         DDIM sampling with full cross-attention.
         """
         self.model.eval()
+        model_dtype = next(self.model.parameters()).dtype
         with torch.no_grad():
             batch_size = shape[0]
             voxel_grid = torch.zeros((batch_size, shape[1], shape[2], shape[3], 
-                                     self.model.granularity), device=device)
-            
+                                     self.model.granularity), device=device, dtype=model_dtype)
+
             # Create DDIM timesteps
             timestep_interval = self.diffusion.timesteps // ddim_steps
             ddim_timesteps = list(range(0, self.diffusion.timesteps, timestep_interval))
@@ -1473,9 +1501,9 @@ class LayerXLayerDiffusionTrainerV2:
             generated_layers = []
 
             for layer_idx in range(self.model.granularity):
-                l = torch.full((batch_size,), layer_idx, device=device, dtype=torch.float32)
-                x = torch.randn(shape, device=device)
-                
+                l = torch.full((batch_size,), layer_idx, device=device, dtype=model_dtype)
+                x = torch.randn(shape, device=device, dtype=model_dtype)
+
                 # Stack previous layers
                 if len(generated_layers) > 0:
                     prev_layers = torch.stack(generated_layers, dim=1)
@@ -1483,7 +1511,7 @@ class LayerXLayerDiffusionTrainerV2:
                     prev_layers = None
                 
                 for i, t in enumerate(ddim_timesteps):
-                    t_batch = torch.full((batch_size,), t, device=device, dtype=torch.float32)
+                    t_batch = torch.full((batch_size,), t, device=device, dtype=model_dtype)
                     predicted_noise = self.model(x, t_batch, l, context, prev_layers)
                     
                     # DDIM update rule
@@ -1519,7 +1547,7 @@ class LayerXLayerDiffusionTrainerV2:
         total_occupancy = 0
         total_density = 0
         num_batches = 0
-        
+        model_dtype = next(self.model.parameters()).dtype
         with torch.no_grad():
             for batch_idx, batch in enumerate(dataloader):
                 if max_batches is not None and batch_idx >= max_batches:
@@ -1537,7 +1565,7 @@ class LayerXLayerDiffusionTrainerV2:
                     current_layer = x0[:, :, :, :, layer_idx]
                     t = torch.randint(0, self.diffusion.timesteps, (batch_size,), device=device).long()
                     xt, noise = self.diffusion.forward(current_layer, t)
-                    l = torch.full((batch_size,), layer_idx, device=device, dtype=torch.float32)
+                    l = torch.full((batch_size,), layer_idx, device=device, dtype=model_dtype)
                     
                     # Stack previous layers
                     if len(prev_layers_list) > 0:
@@ -1545,7 +1573,7 @@ class LayerXLayerDiffusionTrainerV2:
                     else:
                         prev_layers = None
                     
-                    predicted_noise = self.model(xt, t.float(), l, context, prev_layers)
+                    predicted_noise = self.model(xt, t, l, context, prev_layers)
                     
                     if self.teacher_forcing:
                         prev_layers_list.append(current_layer.detach())
@@ -1854,6 +1882,8 @@ class TrainingVoxelVisualizer:
         This is a wrapper around the trainer's generation method.
         """
         trainer.model.eval()
+        model_dtype = next(trainer.model.parameters()).dtype
+        
         with torch.no_grad():
             batch_size = num_samples
             prev_layer_features = None
@@ -1867,10 +1897,10 @@ class TrainingVoxelVisualizer:
             
             for layer_idx in layer_pbar:
                 # Create a tensor for the current layer index
-                l = torch.full((batch_size,), layer_idx, device=device, dtype=torch.float32)
+                l = torch.full((batch_size,), layer_idx, device=device, dtype=model_dtype)
 
                 # Start with pure noise for this layer
-                x = torch.randn(shape, device=device)
+                x = torch.randn(shape, device=device, dtype=model_dtype)
 
                 # Progress bar for diffusion timesteps (nested)
                 timestep_pbar = tqdm(
@@ -1883,7 +1913,7 @@ class TrainingVoxelVisualizer:
 
                 # Run diffusion to convergence for this layer
                 for t in timestep_pbar:
-                    t_batch = torch.full((batch_size,), t, device=device, dtype=torch.float32)
+                    t_batch = torch.full((batch_size,), t, device=device, dtype=model_dtype)
                     predicted_noise, prev_layer_features = trainer.model(x, t_batch, l, context, prev_layer_features)
 
                     alpha_t = trainer.diffusion.alphas[t]
@@ -1913,14 +1943,15 @@ class TrainingVoxelVisualizer:
         Generate samples with DDIM and a progress bar showing layer-by-layer progress.
         """
         trainer.model.eval()
+        model_dtype = next(trainer.model.parameters()).dtype
         with torch.no_grad():
             batch_size = num_samples
             prev_layer_features = None
             shape = (num_samples, 1, granularity, granularity)
-            
-            voxel_grid = torch.zeros((batch_size, shape[1], shape[2], shape[3], 
-                                      trainer.model.granularity), device=device)
-            
+
+            voxel_grid = torch.zeros((batch_size, shape[1], shape[2], shape[3],
+                                      trainer.model.granularity), device=device, dtype=model_dtype)
+
             # Create subset of timesteps for DDIM
             timestep_interval = trainer.diffusion.timesteps // trainer.ddim_steps
             ddim_timesteps = list(range(0, trainer.diffusion.timesteps, timestep_interval))
@@ -1930,9 +1961,9 @@ class TrainingVoxelVisualizer:
             layer_pbar = tqdm(range(trainer.model.granularity), desc="Generating layers (DDIM)", unit="layer")
             
             for layer_idx in layer_pbar:
-                l = torch.full((batch_size,), layer_idx, device=device, dtype=torch.float32)
-                x = torch.randn(shape, device=device)
-                
+                l = torch.full((batch_size,), layer_idx, device=device, dtype=model_dtype)
+                x = torch.randn(shape, device=device, dtype=model_dtype)
+
                 # Progress bar for DDIM timesteps
                 timestep_pbar = tqdm(
                     enumerate(ddim_timesteps),
@@ -1943,7 +1974,7 @@ class TrainingVoxelVisualizer:
                 )
                 
                 for i, t in timestep_pbar:
-                    t_batch = torch.full((batch_size,), t, device=device, dtype=torch.float32)
+                    t_batch = torch.full((batch_size,), t, device=device, dtype=model_dtype)
                     
                     predicted_noise, prev_layer_features = trainer.model(
                         x, t_batch, l, context, prev_layer_features
@@ -2144,36 +2175,31 @@ print_main("="*60)
 
 layer_by_layer_convergence = True  # Whether to run diffusion to convergence for each layer
 layer_diffusion = ForwardDiffusion(timesteps=1000, schedule='cosine')
-unet = UNet(
-    in_channels=1, 
-    model_channels=64, 
-    context_dim=768, 
-    attention_resolutions=[8, 16, 32]  # Apply attention at 8x8, 16x16 and 32x32 feature maps
-).to(device)
 
-
-
+print_main("Creating LayerXLayerDiffusionModelV2...")
 layer_x_layer_model = LayerXLayerDiffusionModelV2(
-    base_model=unet,
     layer_context_dim=layer_context_dim,
     granularity=granularity,
-    text_context_dim=768,      # NEW: T5 embedding dimension
-    max_context_layers=16      # NEW: Sliding window size (try 16, 32, or None)
-).to(device)
+    text_context_dim=768,      
+    max_context_layers=16,    # Sliding window of 16 previous layers for context
+    in_channels=1, 
+    model_channels=512, 
+    context_dim=768, 
+    attention_resolutions=[8, 16, 32]  # Apply attention at 8x8, 16x16 and 32x32 feature maps
+)
 
-# Print model size before sharding
-if rank == 0:
-    total_params = sum(p.numel() for p in layer_x_layer_model.parameters())
-    trainable_params = sum(p.numel() for p in layer_x_layer_model.parameters() if p.requires_grad)
-    print_main(f"Model Parameters: {total_params:,} total, {trainable_params:,} trainable")
+print_main("Initializing model weights...")
+layer_x_layer_model = initialize_model_weights(layer_x_layer_model)
+layer_x_layer_model = layer_x_layer_model.to(device)
+print_main("✓ Model weights initialized")
 
-# Wrap with FSDP if sharding is enabled
+# NOW wrap with FSDP (if enabled)
 if args.shard_model:
-    print_main("\nWrapping model with FSDP...")
+    print_main("Wrapping model with FSDP...")
     fsdp_config = get_fsdp_config()
     layer_x_layer_model = FSDP(layer_x_layer_model, **fsdp_config)
     print_main("✓ Model wrapped with FSDP")
-else:
+else:    
     print_main("Running without model sharding (single GPU)")
 
 print_main("="*60 + "\n")
@@ -2195,32 +2221,19 @@ layer_x_layer_trainer = LayerXLayerDiffusionTrainerV2(
 batch_size = 4
 
 # %%
-# Training dataloader
-# dataloader_3d_train = DataLoader(VoxelDataset(
-#     npy_folder_path=f'/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_voxels/{granularity}', 
-#     description_folder_path='/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_descriptions', 
-#     granularity=granularity, test_count=100  # Use full training set
-# ), batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-
-# # Validation dataloader (smaller subset for faster validation)
-# dataloader_3d_val = DataLoader(VoxelDataset(
-#     npy_folder_path=f'/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_voxels/{granularity}', 
-#     description_folder_path='/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_descriptions', 
-#     granularity=granularity, test_count=100  # Use 100 samples for validation
-# ), batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-
 train_dataset_3d = VoxelDataset(
     npy_folder_path=f'/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_voxels/{granularity}', 
     description_folder_path='/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_descriptions', 
-    granularity=granularity, test_count=100  # Use full training set
+    granularity=granularity, test_count=0  # Use full training set (set greater than 0 to limit)
 )
 
 val_dataset_3d = VoxelDataset(
     npy_folder_path=f'/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_voxels/{granularity}', 
     description_folder_path='/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_descriptions', 
-    granularity=granularity, test_count=100  # Use 100 samples for validation
+    granularity=granularity, test_count=0  # Use 100 samples for validation (set greater than 0 to limit)
 )
 
+train_dataset_3d.save_miss_report("debug_misses.txt")
 
 # Replace your existing dataloader creation with:
 batch_size = args.batch_size if args.batch_size is not None else 4  # Your default batch size
@@ -2252,26 +2265,45 @@ print(f"T5 model loaded with {sum(p.numel() for p in t5_model.parameters()):,} p
 print("\n" + "="*60)
 print("Setting up T5 Embedding Cache")
 print("="*60)
-embedding_cache = T5EmbeddingCache(cache_dir='./t5_cache', max_length=77)
-embedding_cache.load_cache()  # Load existing cache if available
 
-# Precompute embeddings for all descriptions in both train and val datasets
-all_descriptions_train = list(dataloader_3d_train.dataset.descriptions.values())
-all_descriptions_val = list(dataloader_3d_val.dataset.descriptions.values())
-all_descriptions = list(set(all_descriptions_train + all_descriptions_val))  # Unique descriptions only
+if rank == 0:
+    embedding_cache = T5EmbeddingCacheSQL(cache_dir='./t5_cache', max_length=77, memory_cache_size=1_000)
+    embedding_cache.load_cache()  # Load existing cache if available
 
-print(f"Total unique descriptions to cache: {len(all_descriptions)}")
-embedding_cache.precompute_embeddings(
-    texts=all_descriptions,
-    tokenizer=t5_tokenizer,
-    model=t5_model,
-    device=device,
-    batch_size=32
-)
 
-# Optional: Free T5 model from GPU to save memory (embeddings are now cached)
-t5_model = t5_model.cpu()
+
+    description_dataloader = DataLoader(
+        train_dataset_3d, # Use training dataset descriptions for caching
+        batch_size=128,  # Larger batch since we're discarding voxel data
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False
+    )
+
+    # Precompute embeddings using the DataLoader
+    embedding_cache.precompute_embeddings(
+        dataloader_or_texts=description_dataloader,
+        tokenizer=t5_tokenizer,
+        model=t5_model,
+        device=device,
+        batch_size=32  # Batch size for T5 embedding computation
+    )
+
+    embedding_cache.save_cache()
+    del description_dataloader
+    t5_model = t5_model.cpu()
+
+    print("✓ T5 embeddings cached successfully.")
+
+if is_distributed:
+    dist.barrier()
+
+if rank != 0:
+    embedding_cache = T5EmbeddingCacheSQL(cache_dir='./t5_cache', max_length=77, memory_cache_size=1_000)
+    embedding_cache.load_cache()
+
 print("✓ T5 embeddings cached! Training will use cached embeddings for speed.\n")
+torch.cuda.empty_cache()
 
 voxel_visualizer = TrainingVoxelVisualizer(
     save_dir='./training_samples',
@@ -2283,8 +2315,6 @@ n_epochs_3d = 500
 visualization_interval = 25
 validation_interval = 10  # Run validation every N epochs
 use_ema_3d = False
-
-
 
 # Track best model
 best_val_loss = float('inf')
@@ -2309,8 +2339,9 @@ print_main(f"Total Epochs: {n_epochs_3d}")
 print_main(f"Validation Interval: {validation_interval}")
 print_main("="*60 + "\n")
 
+torch.cuda.empty_cache()
+
 for epoch in range(n_epochs_3d):
-    # CRITICAL: Set epoch for distributed sampler (ensures proper shuffling)
     if is_distributed and train_sampler is not None:
         train_sampler.set_epoch(epoch)
     
@@ -2332,7 +2363,11 @@ for epoch in range(n_epochs_3d):
         pbar = dataloader_3d_train
     
     for x0, description in pbar:
-        x0 = x0.to(device, non_blocking=True)  # Async transfer
+        if is_distributed:
+            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        else:
+            dtype = torch.float16
+        x0 = x0.to(device, dtype=dtype, non_blocking=True)
         
         # Get cached context embeddings
         context = embedding_cache.get_batch_embeddings(description, device)
@@ -2372,6 +2407,7 @@ for epoch in range(n_epochs_3d):
     if (epoch + 1) % validation_interval == 0:
         if rank == 0:
             print(f"\nRunning validation...")
+            torch.cuda.empty_cache()
             
             if use_ema_3d:
                 ema_model_3d.apply_shadow()

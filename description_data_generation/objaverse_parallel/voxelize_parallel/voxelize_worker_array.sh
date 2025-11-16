@@ -17,16 +17,24 @@ which python
 python --version
 
 # Set environment variables for better CPU performance
-export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
-export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
-export NUMEXPR_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
 
 # Job parameters
 TOTAL_CHUNKS=$SLURM_ARRAY_TASK_COUNT
 CHUNK_ID=$SLURM_ARRAY_TASK_ID
 
-# Log file for this worker
-LOG_FILE="logs/voxel_worker_${CHUNK_ID}.log"
+echo "==================== DEBUG INFO ===================="
+echo "About to run Python script"
+echo "Script exists: $(ls -la voxelize_worker_cached.py)"
+echo "File list exists: $(ls -la $FILE_LIST)"
+echo "Output dir exists: $(ls -ld $OUTPUT_DIR)"
+echo "===================================================="
+
+export PYTHONUNBUFFERED=1
+
 
 echo "==================== JOB INFO ===================="
 echo "Starting worker $CHUNK_ID of $TOTAL_CHUNKS"
@@ -41,13 +49,12 @@ echo "Voxel Resolution: $VOXEL_RESOLUTION"
 echo "=================================================="
 
 # Run the worker script with cached file list
-python3 voxelize_worker_cached.py \
+python3 -u  voxelize_worker_cached.py \
     --file_list "$FILE_LIST" \
     --output_dir "$OUTPUT_DIR" \
     --chunk_id $CHUNK_ID \
     --total_chunks $TOTAL_CHUNKS \
     --check_dir "$OUTPUT_DIR" \
-    --log_file "$LOG_FILE" \
     --voxel_resolution $VOXEL_RESOLUTION
 
 # Check exit code

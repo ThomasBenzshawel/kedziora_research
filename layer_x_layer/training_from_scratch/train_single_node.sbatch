@@ -4,10 +4,10 @@
 #SBATCH --error=logs/train_%j.err
 #SBATCH --nodes=1                    # Single node
 #SBATCH --ntasks-per-node=1          # One task (torchrun will handle multi-GPU)
-#SBATCH --cpus-per-task=32           # CPUs for data loading (adjust based on GPU count)
-#SBATCH --mem=256G                   # Memory per node
-#SBATCH --gres=gpu:4                 # Request 4 GPUs (change to 2, 4, 8 as needed)
-#SBATCH --partition=dgxh100          # GPU partition (adjust for your cluster)
+#SBATCH --cpus-per-task=64           # CPUs for data loading (adjust based on GPU count)
+#SBATCH --mem=256                 # Memory per node
+#SBATCH --gres=gpu:2                 # Request 4 GPUs (change to 2, 4, 8 as needed)
+#SBATCH --partition=dgx       # GPU partition 
 #SBATCH --account=undergrad_research
 
 # =============================================================================
@@ -156,7 +156,8 @@ fi
 echo "Executing command:"
 echo "$CMD"
 echo "=========================================="
-
+# add the cuda launch blocking variable
+export CUDA_LAUNCH_BLOCKING=1
 # Run the training
 $CMD
 
