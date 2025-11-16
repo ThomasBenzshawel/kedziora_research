@@ -55,7 +55,7 @@
 # 6. Full Model Sharding without CPU Offload (Recommended)
 # Good balance of memory savings and performance
 # Best when: Model is large but can fit with sharding alone
-torchrun --nproc_per_node=4 train.py \
+torchrun --nproc_per_node=4 train_v4.py \
     --shard_model \
     --sharding_strategy FULL_SHARD \
     --mixed_precision

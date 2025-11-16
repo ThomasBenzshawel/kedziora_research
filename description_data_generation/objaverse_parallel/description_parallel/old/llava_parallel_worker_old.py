@@ -2,7 +2,6 @@
 """
 Parallel worker version of the LLaVA image processing script
 Supports distributed processing across multiple GPUs using SLURM
-UPDATED: Uses pre-generated file list to match voxel filenames exactly
 """
 
 import sys
@@ -50,7 +49,6 @@ import argparse
 import fcntl
 import hashlib
 import random
-from pathlib import Path
 
 # Disable any debugger calls
 import builtins
@@ -175,22 +173,23 @@ def optimized_inference(model, tokenizer, input_ids, images, image_sizes, max_ne
     
     return tokenizer.batch_decode(response, skip_special_tokens=True)[0]
 
-def fetch_object_metadata(uid):
-    """Fetch metadata for a single object by UID"""
+def fetch_object_metadata(folder_path):
+    """Fetch metadata for a single object"""
+    object_uid = folder_path.split("/")[-1]
     try:
         start_time = time()
-        object_metadata = objaverse.load_annotations([uid])
+        object_metadata = objaverse.load_annotations([object_uid])
         search_time = time() - start_time
         
-        if 'name' in object_metadata[uid]:
-            object_name = object_metadata[uid]['name']
+        if 'name' in object_metadata[object_uid]:
+            object_name = object_metadata[object_uid]['name']
         else:
             object_name = "Unknown Object"
         
-        return uid, object_name, search_time
+        return object_uid, object_name, search_time
     except Exception as e:
-        print(f"Error fetching metadata for {uid}: {e}")
-        return uid, "Unknown Object", 0
+        print(f"Error fetching metadata for {object_uid}: {e}")
+        return object_uid, "Unknown Object", 0
 
 class DistributedMetadataCache:
     """Thread-safe cache for object metadata with file locking for distributed access"""
@@ -289,117 +288,78 @@ class DistributedMetadataCache:
         with self.lock:
             return object_uid in self.cache
     
-    def get_missing_uids(self, uid_list):
-        """Get list of UIDs that are not in cache"""
+    def get_missing_uids(self, folder_paths):
+        """Get list of object UIDs that are not in cache"""
         missing = []
         with self.lock:
-            for uid in uid_list:
-                if uid not in self.cache:
-                    missing.append(uid)
+            for folder_path in folder_paths:
+                object_uid = folder_path.split("/")[-1]
+                if object_uid not in self.cache:
+                    missing.append(folder_path)
         return missing
 
-def load_file_list(file_list_path):
+def get_worker_folders(target_folder, output_dir, worker_id, total_workers):
     """
-    Load the pre-generated file list from JSON.
-    
-    Args:
-        file_list_path: Path to the JSON file containing file list
-    
-    Returns:
-        List of tuples: [(uid, glb_path), ...]
+    Get folders assigned to this worker using consistent hashing
     """
-    print(f"Loading file list from: {file_list_path}")
+    all_folders = []
     
-    with open(file_list_path, 'r') as f:
-        data = json.load(f)
-    
-    print(f"File list loaded. Total files: {len(data['files'])}")
-    print(f"File list generated at: {data['scan_timestamp']}")
-    
-    # Convert to list of (uid, path) tuples
-    items = [(uid, Path(path)) for uid, path in data['files']]
-    
-    return items
-
-def uid_to_image_folder(uid, images_base_dir):
-    """
-    Convert UID to corresponding image folder path.
-    
-    Example:
-        UID: suvLuxury
-        Images: /path/to/images/suvLuxury/
-    """
-    return Path(images_base_dir) / uid
-
-def get_worker_items(file_list_path, images_base_dir, output_dir, worker_id, total_workers):
-    """
-    Get (uid, image_folder) pairs assigned to this worker using consistent hashing.
-    Uses the same file list as voxelization to ensure UID matching.
-    """
-    # Load file list
-    all_items = load_file_list(file_list_path)
-    
-    print(f"Worker {worker_id}: Checking which items need processing...")
-    
-    # Convert UIDs to image folder paths and filter
-    items_to_check = []
-    for uid, glb_path in all_items:
-        image_folder = uid_to_image_folder(uid, images_base_dir)
-        items_to_check.append((uid, image_folder))
-    
-    # Use consistent hashing to assign items to workers
-    worker_items = []
-    for uid, image_folder in items_to_check:
-        uid_hash = int(hashlib.md5(uid.encode()).hexdigest(), 16)
-        if uid_hash % total_workers == worker_id:
-            worker_items.append((uid, image_folder))
-    
-    # Filter out already processed items
-    items_to_process = []
-    for uid, image_folder in worker_items:
-        output_file = Path(output_dir) / f"{uid}.txt"
+    print(f"Worker {worker_id}: Scanning folders...")
+    for folder in os.listdir(target_folder):
+        folder_path = os.path.join(target_folder, folder)
         
-        # Check if output already exists
-        if output_file.exists():
+        # Skip if not a directory
+        if not os.path.isdir(folder_path):
             continue
         
-        # Check if image folder exists and has exactly 6 images
-        if not image_folder.exists() or not image_folder.is_dir():
-            continue
-        
+        # Skip if not exactly 6 images
         try:
-            num_images = len([f for f in image_folder.iterdir() 
-                            if f.is_file() and f.suffix.lower() in ['.png', '.jpg', '.jpeg', '.bmp', '.gif']])
+            num_images = len(os.listdir(folder_path))
             if num_images != 6:
                 continue
         except Exception:
             continue
         
-        items_to_process.append((uid, image_folder))
+        all_folders.append(folder_path)
     
-    print(f"Worker {worker_id}: Assigned {len(worker_items)} items, {len(items_to_process)} need processing")
+    # Use consistent hashing to assign folders to workers
+    worker_folders = []
+    for folder_path in all_folders:
+        folder_hash = int(hashlib.md5(folder_path.encode()).hexdigest(), 16)
+        if folder_hash % total_workers == worker_id:
+            worker_folders.append(folder_path)
+    
+    # Filter out already processed folders
+    folders_to_process = []
+    for folder_path in worker_folders:
+        folder_name = folder_path.split("/")[-1]
+        output_file = os.path.join(output_dir, f"{folder_name}.txt")
+        if not os.path.exists(output_file):
+            folders_to_process.append(folder_path)
+    
+    print(f"Worker {worker_id}: Assigned {len(worker_folders)} folders, {len(folders_to_process)} need processing")
     
     # Sort by folder size for better load balancing
-    def get_folder_size(item):
-        uid, folder_path = item
+    def get_folder_size(folder_path):
         total_size = 0
         try:
-            for img_file in folder_path.iterdir():
-                if img_file.is_file():
-                    total_size += img_file.stat().st_size
+            for img_file in os.listdir(folder_path):
+                img_path = os.path.join(folder_path, img_file)
+                if os.path.isfile(img_path):
+                    total_size += os.path.getsize(img_path)
         except Exception:
             return float('inf')
         return total_size
     
-    items_to_process.sort(key=get_folder_size)
-    return items_to_process
+    folders_to_process.sort(key=get_folder_size)
+    return folders_to_process
 
 def load_and_preprocess_images(folder_path, target_max_size=1024):
-    """Load and preprocess images from folder"""
+    """Same as original implementation"""
     image_paths = []
-    for image_file in sorted(folder_path.iterdir()):
-        if image_file.suffix.lower() in ['.png', '.jpg', '.jpeg', '.bmp', '.gif']:
-            image_paths.append(image_file)
+    for image_file in sorted(os.listdir(folder_path)):
+        if image_file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
+            image_paths.append(os.path.join(folder_path, image_file))
     
     if len(image_paths) != 6:
         raise ValueError(f"Expected 6 images, found {len(image_paths)}")
@@ -431,7 +391,7 @@ def load_and_preprocess_images(folder_path, target_max_size=1024):
     return images
 
 def arrange_images_for_context(images):
-    """Arrange images in optimal order for context"""
+    """Same as original implementation"""
     if len(images) == 6:
         try:
             arranged = [images[0], images[2], images[1], images[3], images[4], images[5]]
@@ -442,7 +402,7 @@ def arrange_images_for_context(images):
     return images
 
 def batch_process_images(image_list, image_processor, model_config, batch_size=8):
-    """Process images in batches"""
+    """Same as original implementation"""
     processed_batches = []
     for i in range(0, len(image_list), batch_size):
         batch = image_list[i:i+batch_size]
@@ -450,19 +410,16 @@ def batch_process_images(image_list, image_processor, model_config, batch_size=8
         processed_batches.extend(processed_batch)
     return processed_batches
 
-def image_data_augmentation(uid, image_folder, metadata_cache, tokenizer, model, image_processor, device, output_dir):
-    """Process a single object using its UID (matches voxel naming)"""
+def image_data_augmentation(folder_path, images, metadata_cache, tokenizer, model, image_processor, device, output_dir):
+    """Process a single folder - same as original but with passed parameters"""
     object_start_time = time()
-    output_file = Path(output_dir) / f"{uid}.txt"
-    
-    if output_file.exists():
-        return None
-    
-    # Get object name from cache
-    object_name, search_time = metadata_cache.get(uid)
-    
-    # Load and process images
-    images = load_and_preprocess_images(image_folder)
+    folder_name = folder_path.split("/")[-1]
+    output_file = os.path.join(output_dir, f"{folder_name}.txt")
+    if os.path.exists(output_file):
+        return
+
+    object_uid = folder_path.split("/")[-1]
+    object_name, search_time = metadata_cache.get(object_uid)
     images = arrange_images_for_context(images)
     
     all_image_tensors = batch_process_images(images, image_processor, model.config, batch_size=6)
@@ -556,10 +513,8 @@ def main():
     parser = argparse.ArgumentParser(description='Parallel LLaVA processing worker')
     parser.add_argument('--worker_id', type=int, required=True, help='Worker ID (0-indexed)')
     parser.add_argument('--total_workers', type=int, required=True, help='Total number of workers')
-    parser.add_argument('--file_list', type=str, default='logs/glb_file_list.json',
-                       help='Path to pre-generated file list JSON (default: logs/glb_file_list.json)')
-    parser.add_argument('--images_base_dir', type=str, default='../objaverse_images', 
-                       help='Path to images base directory')
+    parser.add_argument('--target_folder', type=str, default='../objaverse_images', 
+                       help='Path to input folder')
     parser.add_argument('--output_dir', type=str, default='../objaverse_descriptions',
                        help='Path to output directory for descriptions')
     parser.add_argument('--save_interval', type=int, default=100, 
@@ -568,51 +523,46 @@ def main():
     args = parser.parse_args()
     
     print(f"Worker {args.worker_id}/{args.total_workers} starting...")
-    print(f"Using file list: {args.file_list}")
     
     # Load model
     print("Loading LLaVA model with Flash Attention optimization...")
     tokenizer, model, image_processor, max_length, attention_type, device = load_model_with_flash_attention()
     print(f"Model loaded successfully with {attention_type} attention on {device}!")
     
-    # Get items for this worker (using same file list as voxelization)
-    items_to_process = get_worker_items(
-        args.file_list, args.images_base_dir, args.output_dir, 
-        args.worker_id, args.total_workers
-    )
+    # Get folders for this worker
+    folders_to_process = get_worker_folders(args.target_folder, args.output_dir, args.worker_id, args.total_workers)
+    print(f"Worker {args.worker_id}: Processing {len(folders_to_process)} folders...")
     
-    print(f"Worker {args.worker_id}: Processing {len(items_to_process)} items...")
-    
-    if len(items_to_process) == 0:
-        print(f"Worker {args.worker_id}: No items to process, exiting.")
+    if len(folders_to_process) == 0:
+        print(f"Worker {args.worker_id}: No folders to process, exiting.")
         return
     
     # Create metadata cache
     metadata_cache = DistributedMetadataCache(args.worker_id)
     
-    # Find UIDs that need metadata fetching
-    uids_to_process = [uid for uid, _ in items_to_process]
-    uids_needing_metadata = metadata_cache.get_missing_uids(uids_to_process)
+    # Find folders that need metadata fetching
+    folders_needing_metadata = metadata_cache.get_missing_uids(folders_to_process)
     
-    if len(uids_needing_metadata) > 0:
-        print(f"Worker {args.worker_id}: Pre-fetching metadata for {len(uids_needing_metadata)} objects...")
+    if len(folders_needing_metadata) > 0:
+        print(f"Worker {args.worker_id}: Pre-fetching metadata for {len(folders_needing_metadata)} objects...")
         prefetch_start_time = time()
         
         with ThreadPoolExecutor(max_workers=16) as executor:
-            future_to_uid = {executor.submit(fetch_object_metadata, uid): uid
-                            for uid in uids_needing_metadata}
+            future_to_folder = {executor.submit(fetch_object_metadata, folder_path): folder_path
+                              for folder_path in folders_needing_metadata}
             
             completed = 0
-            with tqdm.tqdm(total=len(uids_needing_metadata), 
+            with tqdm.tqdm(total=len(folders_needing_metadata), 
                           desc=f"Worker {args.worker_id} fetching metadata") as pbar:
-                for future in as_completed(future_to_uid):
-                    uid = future_to_uid[future]
+                for future in as_completed(future_to_folder):
+                    folder_path = future_to_folder[future]
                     try:
                         object_uid, object_name, search_time = future.result()
                         metadata_cache.set(object_uid, object_name, search_time)
                     except Exception as e:
-                        print(f"Error fetching metadata for {uid}: {e}")
-                        metadata_cache.set(uid, "Unknown Object", 0)
+                        print(f"Error fetching metadata for {folder_path}: {e}")
+                        object_uid = folder_path.split("/")[-1]
+                        metadata_cache.set(object_uid, "Unknown Object", 0)
                     
                     completed += 1
                     pbar.update(1)
@@ -624,23 +574,21 @@ def main():
         prefetch_time = time() - prefetch_start_time
         print(f"Worker {args.worker_id}: Metadata prefetch completed in {prefetch_time:.2f}s")
     
-    # Process items
+    # Process folders
     total_start_time = time()
     successful_processes = 0
     
     print(f"Worker {args.worker_id}: Starting processing...")
     
-    with tqdm.tqdm(total=len(items_to_process), 
+    with tqdm.tqdm(total=len(folders_to_process), 
                   desc=f"Worker {args.worker_id} processing") as pbar:
-        for i, (uid, image_folder) in enumerate(items_to_process):
+        for i, folder_path in enumerate(folders_to_process):
             try:
+                images = load_and_preprocess_images(folder_path)
                 process_time = image_data_augmentation(
-                    uid, image_folder, metadata_cache, tokenizer, model, 
-                    image_processor, device, args.output_dir
+                    folder_path, images, metadata_cache, tokenizer, model, image_processor, device, args.output_dir
                 )
-                
-                if process_time is not None:
-                    successful_processes += 1
+                successful_processes += 1
                 
                 # Memory optimization
                 if successful_processes % 10 == 0:
@@ -651,7 +599,7 @@ def main():
                     metadata_cache.save_to_file()
                 
             except Exception as e:
-                print(f"Worker {args.worker_id}: Error processing {uid}: {e}")
+                print(f"Worker {args.worker_id}: Error processing {folder_path}: {e}")
                 continue
             
             pbar.update(1)
@@ -662,7 +610,7 @@ def main():
     
     total_time = time() - total_start_time
     print(f"\nWorker {args.worker_id} COMPLETE!")
-    print(f"Processed: {successful_processes}/{len(items_to_process)} items")
+    print(f"Processed: {successful_processes}/{len(folders_to_process)} folders")
     print(f"Total time: {total_time:.2f} seconds")
     if successful_processes > 0:
         print(f"Average time per object: {total_time / successful_processes:.2f} seconds")

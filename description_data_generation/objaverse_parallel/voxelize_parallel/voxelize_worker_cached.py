@@ -12,15 +12,15 @@ import trimesh
 from datetime import datetime
 from scipy.spatial import ConvexHull
 from sklearn.decomposition import PCA
+import multiprocessing as mp
 
-def setup_logging(log_file=None):
+
+def setup_logging():
     """Set up logging configuration"""
     log_format = '%(asctime)s - %(levelname)s - %(message)s'
     
     handlers = [logging.StreamHandler(sys.stdout)]
-    if log_file:
-        handlers.append(logging.FileHandler(log_file))
-    
+
     logging.basicConfig(
         level=logging.INFO,
         format=log_format,
@@ -154,6 +154,7 @@ def find_stable_orientation(mesh, logger=None):
         
     finally:
         del vertices
+        del candidates
         gc.collect()
 
 
@@ -185,22 +186,39 @@ def voxelize_mesh(mesh, voxel_resolution):
         if isinstance(voxel_resolution, tuple):
             voxel_resolution = voxel_resolution[0]
         
-        # Use trimesh's voxelize
-        voxelized = mesh.voxelized(pitch=mesh.extents.max() / voxel_resolution)
+        # Validate mesh has non-zero extents
+        max_extent = mesh.extents.max()
+        if max_extent < 1e-6:
+            raise ValueError(f"Degenerate mesh with extent {max_extent}")
+        
+        # Calculate pitch with safety check
+        pitch = max_extent / voxel_resolution
+        if pitch <= 0 or not np.isfinite(pitch):
+            raise ValueError(f"Invalid pitch: {pitch}")
+        
+        # Use trimesh's voxelize with validated pitch
+        voxelized = mesh.voxelized(pitch=pitch)
         
         # Convert to dense boolean array
         voxel_grid = voxelized.matrix
+        del voxelized  # Free memory immediately
+        gc.collect()
         
         # Ensure cubic grid
         current_shape = voxel_grid.shape
         max_dim = max(current_shape)
-        print(f"max_dim: {max_dim}, target: {voxel_resolution}")
         
         if max_dim > voxel_resolution:
-            # Downsample if too large
+            # Downsample if too large - use chunked processing for memory
             from scipy.ndimage import zoom
             scale_factors = [voxel_resolution / d for d in current_shape]
-            voxel_grid = zoom(voxel_grid.astype(float), scale_factors, order=0) > 0.5
+            
+            # Free original before creating scaled version
+            voxel_grid_scaled = zoom(voxel_grid.astype(np.float32), scale_factors, order=0) > 0.5
+            del voxel_grid
+            voxel_grid = voxel_grid_scaled
+            del voxel_grid_scaled
+            gc.collect()
         
         # Pad to cubic
         padded_grid = np.zeros((voxel_resolution, voxel_resolution, voxel_resolution), dtype=bool)
@@ -216,13 +234,19 @@ def voxelize_mesh(mesh, voxel_resolution):
         y_end = min(y_start + sy, voxel_resolution)
         z_end = min(z_start + sz, voxel_resolution)
         
-        padded_grid[x_start:x_end, y_start:y_end, z_start:z_end] = voxel_grid[:x_end-x_start, :y_end-y_start, :z_end-z_start]
+        padded_grid[x_start:x_end, y_start:y_end, z_start:z_end] = \
+            voxel_grid[:x_end-x_start, :y_end-y_start, :z_end-z_start]
+        
+        del voxel_grid
+        gc.collect()
         
         return padded_grid.astype(np.uint8)
         
+    except Exception as e:
+        raise ValueError(f"Voxelization failed: {str(e)}")
     finally:
-        del mesh
         gc.collect()
+
 
 def validate_voxel_tensor(voxel_tensor, logger=None):
     """Validate the voxel tensor for training compatibility"""
@@ -265,16 +289,28 @@ def glb_to_voxel_tensor(glb_path, output_path, metadata_path, voxel_resolution=6
     if isinstance(voxel_resolution, int):
         voxel_resolution = (voxel_resolution, voxel_resolution, voxel_resolution)
     
-
     try:
         # Load mesh
         mesh = trimesh.load(glb_path, force='mesh')
         
         if not isinstance(mesh, trimesh.Trimesh):
             if isinstance(mesh, trimesh.Scene):
-                mesh = mesh.dump(concatenate=True)
+                scene = mesh
+                mesh = scene.dump(concatenate=True)
+                del scene
+                gc.collect()
             else:
                 raise ValueError(f"Unsupported mesh type: {type(mesh)}")
+        
+        # Validate mesh before processing
+        if len(mesh.vertices) == 0:
+            raise ValueError("Empty mesh (no vertices)")
+        if len(mesh.faces) == 0:
+            raise ValueError("Empty mesh (no faces)")
+        
+        # Check for degenerate mesh
+        if mesh.extents.max() < 1e-6:
+            raise ValueError(f"Degenerate mesh with extents {mesh.extents}")
         
         # Store original bounds
         original_bounds = mesh.bounds.copy()
@@ -301,6 +337,10 @@ def glb_to_voxel_tensor(glb_path, output_path, metadata_path, voxel_resolution=6
         max_extent = mesh.extents.max()
         scale_factor = 0.95 / max_extent if max_extent > 0 else 1.0
         mesh.vertices *= scale_factor
+        
+        # Final validation before voxelization
+        if mesh.extents.max() < 1e-6:
+            raise ValueError("Mesh became degenerate after scaling")
         
         # Voxelize
         voxel_tensor = voxelize_mesh(mesh, voxel_resolution)
@@ -357,8 +397,10 @@ def load_file_list(file_list_path, logger):
     """
     logger.info(f"Loading file list from: {file_list_path}")
     
+    print(f"Loading file list from: {file_list_path}", flush=True)
     with open(file_list_path, 'r') as f:
         data = json.load(f)
+    print(f"File list loaded. Total files: {len(data['files'])}", flush=True)
     
     logger.info(f"File list generated at: {data['scan_timestamp']}")
     logger.info(f"Scanned directories: {data['scan_directories']}")
@@ -370,12 +412,76 @@ def load_file_list(file_list_path, logger):
     return items
 
 
+def process_single_file(args):
+    """
+    Process a single file in isolation to prevent memory leaks.
+    This function runs in a separate process.
+    """
+    uid, glb_path, output_dir, check_dir, voxel_resolution, auto_orient = args
+    
+    # Import here to avoid sharing memory between processes
+    import logging
+    import sys
+    
+    # Set up minimal logging for this process
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.WARNING)  # Only show warnings/errors to reduce output
+    
+    try:
+        # Create output paths
+        voxel_subdir = Path(output_dir) / str(voxel_resolution)
+        voxel_subdir.mkdir(parents=True, exist_ok=True)
+        
+        metadata_subdir = voxel_subdir / 'metadata'
+        metadata_subdir.mkdir(parents=True, exist_ok=True)
+        
+        output_filename = uid + '.npy'
+        metadata_filename = uid + '.json'
+        
+        output_path = voxel_subdir / output_filename
+        metadata_path = metadata_subdir / metadata_filename
+        
+        # Check if already processed
+        if check_dir:
+            check_path = Path(check_dir) / str(voxel_resolution) / output_filename
+        else:
+            check_path = output_path
+        
+        if check_path.exists():
+            return 'skipped', uid, None
+        
+        # Check if input exists
+        if not glb_path.exists():
+            return 'failed', uid, f"Input file not found: {glb_path}"
+        
+        # Convert GLB to voxel tensor with orientation
+        binary_tensor, orientation_confidence, validation_warnings = glb_to_voxel_tensor(
+            glb_path, output_path, metadata_path, voxel_resolution=voxel_resolution,
+            auto_orient=auto_orient, logger=logger
+        )
+        
+        # Quick validation
+        occupied_voxels = np.sum(binary_tensor)
+        if occupied_voxels == 0:
+            return 'failed', uid, "Empty voxel tensor"
+        
+        # Return success with validation info
+        return 'success', uid, {'warnings': len(validation_warnings), 'occupied': int(occupied_voxels)}
+        
+    except Exception as e:
+        return 'failed', uid, str(e)
+    finally:
+        # Aggressive cleanup
+        import gc
+        gc.collect()
+
+
 def process_chunk(file_list_path, output_dir, check_dir, chunk_id, total_chunks, 
                   auto_orient, voxel_resolution, logger):
     """
-    Process a chunk of GLB files using pre-generated file list.
+    Process a chunk of GLB files using pre-generated file list with multiprocessing.
     
-    MODIFIED: Instead of scanning directories, this loads from a cached file list.
+    Uses process isolation to prevent trimesh memory leaks.
     """
     # Validate resolution
     if isinstance(voxel_resolution, int):
@@ -402,8 +508,20 @@ def process_chunk(file_list_path, output_dir, check_dir, chunk_id, total_chunks,
         end_idx = start_idx + chunk_size
     
     chunk_items = items[start_idx:end_idx]
+    del items  # Free the full list after extracting the chunk
+    gc.collect()
+    
     logger.info(f"Worker {chunk_id}: Processing items {start_idx} to {end_idx-1} ({len(chunk_items)} items)")
     logger.info(f"Auto-orientation: {'Enabled (stability method)' if auto_orient else 'Disabled'}")
+    
+    # Prepare arguments for multiprocessing
+    args_list = [
+        (uid, glb_path, output_dir, check_dir, voxel_resolution[0], auto_orient)
+        for uid, glb_path in chunk_items
+    ]
+    
+    del chunk_items
+    gc.collect()
     
     # Statistics
     processed = 0
@@ -412,78 +530,48 @@ def process_chunk(file_list_path, output_dir, check_dir, chunk_id, total_chunks,
     validation_issues_count = 0
     start_time = time.time()
     
-    for idx, (uid, glb_path) in enumerate(chunk_items):
-        binary_tensor = None
-        try:
-            # Create output paths
-            voxel_subdir = Path(output_dir) / str(voxel_resolution[0])
-            voxel_subdir.mkdir(parents=True, exist_ok=True)
-            
-            metadata_subdir = voxel_subdir / 'metadata'
-            metadata_subdir.mkdir(parents=True, exist_ok=True)
-            
-            output_filename = uid + '.npy'
-            metadata_filename = uid + '.json'
-            
-            output_path = voxel_subdir / output_filename
-            metadata_path = metadata_subdir / metadata_filename
-            
-            # Check if already processed
-            if check_dir:
-                check_path = Path(check_dir) / str(voxel_resolution[0]) / output_filename
-            else:
-                check_path = output_path
-            
-            if check_path.exists():
+    # Process with isolated workers (restart pool every batch to prevent memory leaks)
+    batch_size = 50  # Process 50 files before restarting the pool
+    total_batches = (len(args_list) + batch_size - 1) // batch_size
+    
+    logger.info(f"Processing {len(args_list)} files in {total_batches} batches of up to {batch_size} files each")
+    
+    for batch_idx in range(total_batches):
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, len(args_list))
+        batch = args_list[batch_start:batch_end]
+        
+        logger.info(f"Starting batch {batch_idx + 1}/{total_batches} ({len(batch)} files)...")
+        
+        # Create a fresh pool for each batch to prevent memory leaks
+        with mp.Pool(processes=1) as pool:
+            results = pool.map(process_single_file, batch)
+        
+        # Process results
+        for status, uid, info in results:
+            if status == 'success':
+                processed += 1
+                if info and info.get('warnings', 0) > 0:
+                    validation_issues_count += 1
+            elif status == 'skipped':
                 skipped += 1
-                if (idx + 1) % 100 == 0:
-                    logger.info(f"Progress: {idx+1}/{len(chunk_items)} - Skipped (already exists): {uid}")
-                continue
-            
-            # Check if input exists
-            if not glb_path.exists():
-                logger.warning(f"Input file not found: {glb_path}")
+            elif status == 'failed':
                 failed += 1
-                continue
-            
-            # Progress logging
-            if (idx + 1) % 10 == 0:
-                elapsed = time.time() - start_time
-                rate = (processed + skipped) / elapsed if elapsed > 0 else 0
-                eta = (len(chunk_items) - idx - 1) / rate if rate > 0 else 0
-                logger.info(f"Progress: {idx+1}/{len(chunk_items)} - Processing: {uid} "
-                          f"(Rate: {rate:.2f} items/s, ETA: {eta/60:.1f} min)")
-            
-            # Convert GLB to voxel tensor with orientation
-            binary_tensor, orientation_confidence, validation_warnings = glb_to_voxel_tensor(
-                glb_path, output_path, metadata_path, voxel_resolution=voxel_resolution,
-                auto_orient=auto_orient, logger=logger
-            )
-            
-            # Track validation issues
-            if validation_warnings:
-                validation_issues_count += 1
-            
-            # Quick validation
-            occupied_voxels = np.sum(binary_tensor)
-            if occupied_voxels == 0:
-                logger.warning(f"Warning: Empty voxel tensor for {uid}")
-            
-            processed += 1
-            
-        except Exception as e:
-            failed += 1
-            logger.error(f"Failed to process {uid}: {str(e)}")
-            if logger.level == logging.DEBUG:
-                logger.debug(traceback.format_exc())
-            continue
-        finally:
-            if binary_tensor is not None:
-                del binary_tensor
-            
-            # Periodic garbage collection
-            if (idx + 1) % 10 == 0:
-                gc.collect()
+                logger.error(f"Failed to process {uid}: {info}")
+        
+        # Log batch progress
+        elapsed = time.time() - start_time
+        items_done = batch_end
+        rate = items_done / elapsed if elapsed > 0 else 0
+        eta = (len(args_list) - items_done) / rate if rate > 0 else 0
+        
+        logger.info(f"Batch {batch_idx + 1}/{total_batches} complete. "
+                   f"Progress: {items_done}/{len(args_list)} "
+                   f"(Processed: {processed}, Skipped: {skipped}, Failed: {failed}) "
+                   f"Rate: {rate:.2f} items/s, ETA: {eta/60:.1f} min")
+        
+        # Force garbage collection between batches
+        gc.collect()
     
     # Final statistics
     elapsed_time = time.time() - start_time
@@ -497,7 +585,7 @@ def process_chunk(file_list_path, output_dir, check_dir, chunk_id, total_chunks,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Voxelization worker - uses pre-generated file list'
+        description='Voxelization worker - uses pre-generated file list with process isolation'
     )
     
     parser.add_argument('--file_list', required=True, 
@@ -510,7 +598,6 @@ def main():
                         help='Total number of chunks')
     parser.add_argument('--check_dir', help='Directory to check for existing files', 
                         default=None)
-    parser.add_argument('--log_file', help='Log file path')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     parser.add_argument('--voxel_resolution', type=int, default=64, 
                         help='Voxel grid resolution (default: 64)')
@@ -524,7 +611,7 @@ def main():
         args.check_dir = args.output_dir
     
     # Set up logging
-    logger = setup_logging(args.log_file)
+    logger = setup_logging()
     if args.debug:
         logger.setLevel(logging.DEBUG)
     
@@ -533,6 +620,9 @@ def main():
     logger.info(f"Using pre-generated file list: {args.file_list}")
     logger.info(f"Resolution: {args.voxel_resolution}^3")
     logger.info(f"Auto-orientation: {'Disabled' if args.no_auto_orient else 'Enabled'}")
+    logger.info(f"Output directory: {args.output_dir}")
+    logger.info(f"Check directory: {args.check_dir}")
+    logger.info(f"Process isolation: Enabled (batch size: 50)")
     logger.info(f"Started at: {datetime.now()}")
     logger.info("="*60)
     
@@ -559,4 +649,9 @@ def main():
         logger.error(traceback.format_exc())
         sys.exit(1)
     
-    logger.info(f"Worker {args.chunk_id
+    logger.info(f"Worker {args.chunk_id} completed successfully.")
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    main()

@@ -5,8 +5,8 @@
 #SBATCH --nodes=1                    # Single node
 #SBATCH --ntasks-per-node=1          # One task (torchrun will handle multi-GPU)
 #SBATCH --cpus-per-task=64           # CPUs for data loading (adjust based on GPU count)
-#SBATCH --mem=256                 # Memory per node
-#SBATCH --gres=gpu:2                 # Request 4 GPUs (change to 2, 4, 8 as needed)
+#SBATCH --mem=432G                # Memory per node
+#SBATCH --gres=gpu:4                 # Request 4 GPUs (change to 2, 4, 8 as needed)
 #SBATCH --partition=dgx       # GPU partition 
 #SBATCH --account=undergrad_research
 
@@ -36,7 +36,7 @@ echo "=========================================="
 # =============================================================================
 
 # Initialize conda using miniforge3
-source /usr/local/miniforge3/etc/profile.d/conda.sh
+source /usr/local/anaconda3/etc/profile.d/conda.sh
 
 # Activate your conda environment
 conda activate /home/ad.msoe.edu/benzshawelt/.conda/envs/layerxlayer

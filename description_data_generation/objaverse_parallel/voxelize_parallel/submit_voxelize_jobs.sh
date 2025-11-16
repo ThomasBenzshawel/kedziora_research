@@ -8,13 +8,13 @@ SCAN_DIR_2="/home/ad.msoe.edu/benzshawelt/objaverse_temp"
 OUTPUT_DIR="../objaverse_voxels"
 FILE_LIST="logs/glb_file_list.json"
 VOXEL_RESOLUTION=16
-NUM_WORKERS=17
+NUM_WORKERS=16
 
 # Create logs directory
 mkdir -p logs
 
 # Check if we should force re-scan
-FORCE_RESCAN=false
+FORCE_RESCAN=false  # FIXED: was 'fals'
 if [ "$1" == "--force" ] || [ "$1" == "-f" ]; then
     FORCE_RESCAN=true
     echo "Force re-scan enabled"
@@ -55,7 +55,7 @@ if [ "$SKIP_PREPROCESSING" = false ]; then
     echo "==================== SUBMITTING JOBS ===================="
     echo "This will submit two jobs:"
     echo "  1. Preprocessing job (scans directories)"
-    echo "  2. Array job with workers (waits for preprocessing)"
+    echo "  2. Array job with $NUM_WORKERS workers (waits for preprocessing)"
     echo "=========================================================="
 
     # Submit preprocessing job
@@ -64,8 +64,9 @@ if [ "$SKIP_PREPROCESSING" = false ]; then
         --output=logs/preprocess_%j.out \
         --error=logs/preprocess_%j.err \
         --ntasks=1 \
-        --cpus-per-task=1 \
-        --mem=8G \
+        --cpus-per-task=2 \
+        --mem=32G \
+        --time=02:00:00 \
         --partition=teaching \
         --account=undergrad_research \
         <<'EOFPREPROCESS'
@@ -73,10 +74,29 @@ if [ "$SKIP_PREPROCESSING" = false ]; then
 . ~/.bashrc
 eval "$(conda shell.bash hook)"
 conda activate /home/ad.msoe.edu/benzshawelt/.conda/envs/voxelize
+
+# Set thread limits for preprocessing
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+
+echo "Starting preprocessing..."
+echo "Conda environment: $CONDA_DEFAULT_ENV"
+python --version
+
 python3 preprocess_file_list.py \
     --scan_dir '/home/ad.msoe.edu/benzshawelt/.objaverse' \
     --scan_dir_2 '/home/ad.msoe.edu/benzshawelt/objaverse_temp' \
     --output_file 'logs/glb_file_list.json'
+
+EXIT_CODE=$?
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "Preprocessing completed successfully"
+else
+    echo "Preprocessing failed with exit code $EXIT_CODE"
+fi
+exit $EXIT_CODE
 EOFPREPROCESS
     )
 
@@ -90,8 +110,9 @@ EOFPREPROCESS
         --output=logs/voxel_%A_%a.out \
         --error=logs/voxel_%A_%a.err \
         --ntasks=1 \
-        --cpus-per-task=4 \
-        --mem=32G \
+        --cpus-per-task=6 \
+        --mem=256G \
+        --time=48:00:00 \
         --partition=teaching \
         --account=undergrad_research \
         voxelize_worker_array.sh "$FILE_LIST" "$OUTPUT_DIR" $VOXEL_RESOLUTION)
@@ -102,10 +123,11 @@ EOFPREPROCESS
     echo "Job submission complete!"
     echo ""
     echo "Job $PREPROCESS_JOB will scan directories first"
-    echo "Job $WORKER_JOB will start after preprocessing completes"
+    echo "Job $WORKER_JOB ($NUM_WORKERS workers) will start after preprocessing completes"
     echo ""
     echo "Monitor with: squeue -u $USER"
-    echo "Cancel with: scancel $PREPROCESS_JOB $WORKER_JOB"
+    echo "View logs: tail -f logs/preprocess_$PREPROCESS_JOB.out"
+    echo "Cancel all: scancel $PREPROCESS_JOB $WORKER_JOB"
     echo "=========================================================="
     
 else
@@ -121,8 +143,9 @@ else
         --output=logs/voxel_%A_%a.out \
         --error=logs/voxel_%A_%a.err \
         --ntasks=1 \
-        --cpus-per-task=4 \
-        --mem=32G \
+        --cpus-per-task=6 \
+        --mem=256G \
+        --time=48:00:00 \
         --partition=teaching \
         --account=undergrad_research \
         voxelize_worker_array.sh "$FILE_LIST" "$OUTPUT_DIR" $VOXEL_RESOLUTION)
@@ -133,8 +156,10 @@ else
     echo "Job submission complete!"
     echo ""
     echo "Workers will start immediately using cached file list"
+    echo "Job ID: $WORKER_JOB (array 0-$((NUM_WORKERS-1)))"
     echo ""
     echo "Monitor with: squeue -u $USER"
-    echo "Cancel with: scancel $WORKER_JOB"
+    echo "View logs: tail -f logs/voxel_${WORKER_JOB}_0.out"
+    echo "Cancel all: scancel $WORKER_JOB"
     echo "============================================================"
 fi

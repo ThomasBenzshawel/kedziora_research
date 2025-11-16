@@ -213,207 +213,6 @@ def setup_git_lfs_with_token():
     except Exception as e:
         logger.warning(f"Error setting up git credentials: {e}")
 
-class CheckpointManager:
-    """Manage checkpoints for resumable downloads."""
-    def __init__(self, job_id: int, checkpoint_dir: str = "./checkpoints"):
-        self.job_id = job_id
-        self.checkpoint_dir = checkpoint_dir
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        self.checkpoint_file = os.path.join(checkpoint_dir, f"checkpoint_job_{job_id}.json")
-        self.completed_objects = set()
-        self.failed_objects = set()
-        self.load_checkpoint()
-    
-    def load_checkpoint(self):
-        """Load existing checkpoint if available."""
-        if os.path.exists(self.checkpoint_file):
-            try:
-                with open(self.checkpoint_file, 'r') as f:
-                    data = json.load(f)
-                    self.completed_objects = set(data.get('completed_objects', []))
-                    self.failed_objects = set(data.get('failed_objects', []))
-                    logger.info(f"Job {self.job_id}: Loaded checkpoint with {len(self.completed_objects)} completed and {len(self.failed_objects)} failed objects")
-            except Exception as e:
-                logger.warning(f"Job {self.job_id}: Failed to load checkpoint: {e}")
-    
-    def save_checkpoint(self):
-        """Save current checkpoint."""
-        try:
-            data = {
-                'job_id': self.job_id,
-                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-                'completed_objects': list(self.completed_objects),
-                'failed_objects': list(self.failed_objects),
-                'total_completed': len(self.completed_objects),
-                'total_failed': len(self.failed_objects)
-            }
-            with open(self.checkpoint_file, 'w') as f:
-                json.dump(data, f, indent=2)
-        except Exception as e:
-            logger.warning(f"Job {self.job_id}: Failed to save checkpoint: {e}")
-    
-    def mark_completed(self, file_identifier: str):
-        """Mark an object as completed."""
-        self.completed_objects.add(str(file_identifier))
-    
-    def mark_failed(self, file_identifier: str):
-        """Mark an object as failed."""
-        self.failed_objects.add(str(file_identifier))
-    
-    def is_completed(self, file_identifier: str) -> bool:
-        """Check if object is already completed."""
-        return str(file_identifier) in self.completed_objects
-    
-    def should_skip(self, file_identifier: str, download_dir: str) -> bool:
-        """Check if object should be skipped (already downloaded or exists on disk)."""
-        file_id = str(file_identifier)
-        
-        # Check checkpoint first
-        if file_id in self.completed_objects:
-            return True
-        
-        # Check if file exists on disk (in case checkpoint was lost)
-        # This is a basic check - adjust path logic based on your download structure
-        possible_paths = [
-            os.path.join(download_dir, file_id),
-            os.path.join(download_dir, f"{file_id}.glb"),
-            os.path.join(download_dir, f"{file_id}.obj"),
-        ]
-        for path in possible_paths:
-            if os.path.exists(path):
-                logger.debug(f"Job {self.job_id}: Found existing file for {file_id}, marking as completed")
-                self.mark_completed(file_id)
-                return True
-        
-        return False
-
-class ProgressTracker:
-    """Track and save download progress periodically."""
-    def __init__(self, job_id: int, total_objects: int, output_dir: str = "./output"):
-        self.job_id = job_id
-        self.total_objects = total_objects
-        self.output_dir = output_dir
-        self.progress_file = os.path.join(output_dir, f"job_{job_id}", f"progress_job_{job_id}.json")
-        os.makedirs(os.path.dirname(self.progress_file), exist_ok=True)
-        
-        self.start_time = time.time()
-        self.objects_processed = 0
-        self.objects_successful = 0
-        self.objects_failed = 0
-        self.current_batch = 0
-        self.total_batches = 0
-        self.last_save_time = time.time()
-    
-    def update(self, batch_num: int = None, successful: int = 0, failed: int = 0):
-        """Update progress counters."""
-        if batch_num is not None:
-            self.current_batch = batch_num
-        self.objects_successful += successful
-        self.objects_failed += failed
-        self.objects_processed = self.objects_successful + self.objects_failed
-    
-    def save_progress(self, force: bool = False):
-        """Save progress to file (with throttling unless forced)."""
-        current_time = time.time()
-        
-        # Only save every 30 seconds unless forced
-        if not force and (current_time - self.last_save_time) < 30:
-            return
-        
-        elapsed_time = current_time - self.start_time
-        objects_per_sec = self.objects_processed / elapsed_time if elapsed_time > 0 else 0
-        remaining_objects = self.total_objects - self.objects_processed
-        estimated_remaining_sec = remaining_objects / objects_per_sec if objects_per_sec > 0 else 0
-        
-        progress_data = {
-            'job_id': self.job_id,
-            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'progress': {
-                'current_batch': self.current_batch,
-                'total_batches': self.total_batches,
-                'objects_processed': self.objects_processed,
-                'objects_successful': self.objects_successful,
-                'objects_failed': self.objects_failed,
-                'total_objects': self.total_objects,
-                'percent_complete': (self.objects_processed / self.total_objects * 100) if self.total_objects > 0 else 0
-            },
-            'timing': {
-                'elapsed_seconds': round(elapsed_time, 2),
-                'elapsed_formatted': self._format_duration(elapsed_time),
-                'objects_per_second': round(objects_per_sec, 2),
-                'estimated_remaining_seconds': round(estimated_remaining_sec, 2),
-                'estimated_remaining_formatted': self._format_duration(estimated_remaining_sec),
-                'estimated_completion_time': time.strftime('%Y-%m-%d %H:%M:%S', 
-                    time.localtime(current_time + estimated_remaining_sec))
-            },
-            'rates': {
-                'success_rate': (self.objects_successful / self.objects_processed * 100) if self.objects_processed > 0 else 0,
-                'failure_rate': (self.objects_failed / self.objects_processed * 100) if self.objects_processed > 0 else 0
-            }
-        }
-        
-        try:
-            with open(self.progress_file, 'w') as f:
-                json.dump(progress_data, f, indent=2)
-            self.last_save_time = current_time
-        except Exception as e:
-            logger.warning(f"Job {self.job_id}: Failed to save progress: {e}")
-    
-    def _format_duration(self, seconds: float) -> str:
-        """Format duration in human-readable format."""
-        if seconds < 60:
-            return f"{int(seconds)}s"
-        elif seconds < 3600:
-            return f"{int(seconds/60)}m {int(seconds%60)}s"
-        else:
-            hours = int(seconds / 3600)
-            minutes = int((seconds % 3600) / 60)
-            return f"{hours}h {minutes}m"
-    
-    def log_progress(self):
-        """Log current progress to console."""
-        elapsed_time = time.time() - self.start_time
-        objects_per_sec = self.objects_processed / elapsed_time if elapsed_time > 0 else 0
-        percent_complete = (self.objects_processed / self.total_objects * 100) if self.total_objects > 0 else 0
-        
-        logger.info(f"Job {self.job_id}: Progress - {self.current_batch}/{self.total_batches} batches | "
-                   f"{self.objects_processed}/{self.total_objects} objects ({percent_complete:.1f}%) | "
-                   f"{objects_per_sec:.2f} obj/s | "
-                   f"Success: {self.objects_successful}, Failed: {self.objects_failed}")
-
-def check_disk_space(path: str, min_gb: float = 10.0, job_id: int = 1) -> dict:
-    """
-    Check available disk space and return status.
-    
-    Args:
-        path: Path to check disk space for
-        min_gb: Minimum GB required (warning threshold)
-        job_id: Job ID for logging
-    
-    Returns:
-        dict with 'available_gb', 'warning', 'critical' status
-    """
-    try:
-        statvfs = os.statvfs(path)
-        available_gb = (statvfs.f_frsize * statvfs.f_bavail) / (1024**3)
-        
-        status = {
-            'available_gb': round(available_gb, 2),
-            'warning': available_gb < min_gb,
-            'critical': available_gb < (min_gb / 2),  # Critical at half the warning threshold
-            'path': path
-        }
-        
-        if status['critical']:
-            logger.error(f"Job {job_id}: CRITICAL - Only {available_gb:.2f} GB available at {path}")
-        elif status['warning']:
-            logger.warning(f"Job {job_id}: WARNING - Only {available_gb:.2f} GB available at {path}")
-        
-        return status
-    except Exception as e:
-        logger.warning(f"Job {job_id}: Failed to check disk space: {e}")
-        return {'available_gb': 0, 'warning': True, 'critical': True, 'path': path}
-
 class DownloadTracker:
     """Track download results in a thread-safe way."""
     def __init__(self, job_id: int = 1):
@@ -443,11 +242,9 @@ class DownloadTracker:
                 simple_metadata[str(k)] = f"<unserializable: {type(v).__name__}>"
         return simple_metadata
 
-# Global instances (will be initialized with job ID)
+# Global tracker instance (will be initialized with job ID)
 tracker = None
 logger = None
-checkpoint_manager = None
-progress_tracker = None
 
 def safe_handle_found_object(local_path: str, file_identifier: str, sha256: str, metadata: Dict[Hashable, Any]) -> None:
     """Called when an object is successfully found and downloaded."""
@@ -462,11 +259,6 @@ def safe_handle_found_object(local_path: str, file_identifier: str, sha256: str,
             'job_id': tracker.job_id
         })
         tracker.download_paths[str(file_identifier)] = str(local_path)
-        
-        # Mark as completed in checkpoint
-        if checkpoint_manager:
-            checkpoint_manager.mark_completed(file_identifier)
-        
         logger.info(f"✓ Successfully downloaded: {file_identifier}")
     except Exception as e:
         logger.error(f"Error in handle_found_object for {file_identifier}: {e}")
@@ -491,11 +283,6 @@ def safe_handle_modified_object(local_path: str, file_identifier: str, new_sha25
             'job_id': tracker.job_id
         })
         tracker.download_paths[str(file_identifier)] = str(local_path)
-        
-        # Mark as completed in checkpoint
-        if checkpoint_manager:
-            checkpoint_manager.mark_completed(file_identifier)
-        
         logger.warning(f"⚠ Modified object downloaded: {file_identifier}")
     except Exception as e:
         logger.error(f"Error in handle_modified_object for {file_identifier}: {e}")
@@ -511,11 +298,6 @@ def safe_handle_missing_object(file_identifier: str, sha256: str, metadata: Dict
             'timestamp': time.time(),
             'job_id': tracker.job_id
         })
-        
-        # Mark as failed in checkpoint
-        if checkpoint_manager:
-            checkpoint_manager.mark_failed(file_identifier)
-        
         logger.error(f"✗ Missing object: {file_identifier}")
     except Exception as e:
         logger.error(f"Error in handle_missing_object for {file_identifier}: {e}")
@@ -532,11 +314,6 @@ def safe_handle_new_object(local_path: str, file_identifier: str, sha256: str, m
             'timestamp': time.time(),
             'job_id': tracker.job_id
         })
-        
-        # Mark as completed in checkpoint
-        if checkpoint_manager:
-            checkpoint_manager.mark_completed(file_identifier)
-        
         logger.info(f"+ New object found: {file_identifier}")
     except Exception as e:
         logger.error(f"Error in handle_new_object for {file_identifier}: {e}")
@@ -594,9 +371,7 @@ def download_objaverse_xl_robust(
     batch_size: int = 1000,
     start_offset: int = 0,
     job_id: int = 1,
-    cleanup_temp: bool = True,
-    min_disk_space_gb: float = 10.0,
-    enable_checkpoints: bool = True
+    cleanup_temp: bool = True
 ) -> Dict:
     """
     Download Objaverse XL dataset with robust batch processing and error recovery.
@@ -611,31 +386,17 @@ def download_objaverse_xl_robust(
         start_offset: Starting index for this job (for job arrays)
         job_id: Job ID for distinguishing parallel jobs
         cleanup_temp: Whether to clean temp directory during and after download
-        min_disk_space_gb: Minimum disk space threshold in GB
-        enable_checkpoints: Whether to enable checkpoint/resume functionality
     
     Returns:
         Dictionary with download results
     """
-    global tracker, checkpoint_manager, progress_tracker
+    global tracker
     tracker = DownloadTracker(job_id)  # Initialize tracker with job ID
-    
-    # Initialize checkpoint manager if enabled
-    if enable_checkpoints:
-        checkpoint_manager = CheckpointManager(job_id)
-        logger.info(f"Job {job_id}: Checkpoint/resume enabled")
     
     # Set up custom temporary directory
     if temp_dir is None:
         temp_dir = os.path.expanduser(f"~/objaverse_temp/job_{job_id}")
     temp_dir = setup_custom_temp_dir(temp_dir, job_id)
-    
-    # Initial disk space check
-    disk_status = check_disk_space(temp_dir, min_disk_space_gb, job_id)
-    if disk_status['critical']:
-        error_msg = f"Critical disk space issue: Only {disk_status['available_gb']} GB available"
-        logger.error(f"Job {job_id}: {error_msg}")
-        return {'error': error_msg}
     
     # Clean temp directory at the start to remove any leftover files from previous runs
     if cleanup_temp:
@@ -674,35 +435,12 @@ def download_objaverse_xl_robust(
     
     # Slice the dataset for this job
     job_subset = filtered.iloc[start_offset:min(end_offset, total_available)]
-    
-    # Filter out already completed objects if checkpoints are enabled
-    if enable_checkpoints and len(checkpoint_manager.completed_objects) > 0:
-        logger.info(f"Job {job_id}: Filtering out {len(checkpoint_manager.completed_objects)} already completed objects")
-        job_subset = job_subset[~job_subset['fileIdentifier'].isin(checkpoint_manager.completed_objects)]
-        logger.info(f"Job {job_id}: {len(job_subset)} objects remaining to download")
-    
     logger.info(f"Job {job_id}: Processing objects {start_offset} to {min(end_offset, total_available)-1}")
     logger.info(f"Job {job_id}: Total objects for this job: {len(job_subset)}")
     
     # Split into batches
     total_objects = len(job_subset)
-    
-    if total_objects == 0:
-        logger.info(f"Job {job_id}: All objects already completed, nothing to download")
-        return {
-            'success': True,
-            'summary': {
-                'job_id': job_id,
-                'message': 'All objects already completed',
-                'total_requested': 0
-            }
-        }
-    
     num_batches = (total_objects + batch_size - 1) // batch_size
-    
-    # Initialize progress tracker
-    progress_tracker = ProgressTracker(job_id, total_objects)
-    progress_tracker.total_batches = num_batches
     
     logger.info(f"Job {job_id}: Starting download of {total_objects} objects in {num_batches} batches")
     logger.info(f"Job {job_id}: Batch size: {batch_size} objects")
@@ -710,7 +448,6 @@ def download_objaverse_xl_robust(
     logger.info(f"Job {job_id}: TEMP directory (will be cleaned): {temp_dir}")
     logger.info(f"Job {job_id}: DOWNLOAD directory (permanent): {download_dir}")
     logger.info(f"Job {job_id}: OUTPUT reports directory: ./output/job_{job_id}")
-    logger.info(f"Job {job_id}: CHECKPOINT directory: ./checkpoints")
     if cleanup_temp:
         logger.info(f"Job {job_id}: CLEANUP: Enabled (before/during/after)")
     else:
@@ -719,27 +456,12 @@ def download_objaverse_xl_robust(
     
     start_time = time.time()
     failed_batches = []
-    last_disk_check_time = time.time()
-    disk_check_interval = 300  # Check every 5 minutes
     
     # Process each batch
     for batch_num in range(num_batches):
         start_idx = batch_num * batch_size
         end_idx = min(start_idx + batch_size, total_objects)
         batch_df = job_subset.iloc[start_idx:end_idx]
-        
-        # Update progress tracker
-        progress_tracker.update(batch_num=batch_num + 1)
-        
-        # Periodic disk space check
-        current_time = time.time()
-        if current_time - last_disk_check_time > disk_check_interval:
-            disk_status = check_disk_space(temp_dir, min_disk_space_gb, job_id)
-            if disk_status['critical']:
-                logger.error(f"Job {job_id}: STOPPING - Critical disk space at batch {batch_num + 1}")
-                failed_batches.append((batch_num + 1, "critical_disk_space"))
-                break
-            last_disk_check_time = current_time
         
         # Try with multiprocessing first
         success, error_type = download_batch(
@@ -750,12 +472,6 @@ def download_objaverse_xl_robust(
             save_repo_format,
             use_multiprocessing=True
         )
-        
-        # Update progress with batch results
-        batch_successful = len([o for o in tracker.found_objects if o.get('timestamp', 0) > start_time])
-        batch_failed = len([o for o in tracker.missing_objects if o.get('timestamp', 0) > start_time])
-        progress_tracker.update(successful=len(batch_df) if success else 0, 
-                               failed=0 if success else len(batch_df))
         
         # If failed due to pickling, retry with single process
         if not success and error_type == "pickling_error":
@@ -797,24 +513,9 @@ def download_objaverse_xl_robust(
         elif not success:
             failed_batches.append((batch_num + 1, error_type))
         
-        # Save checkpoint after each batch
-        if enable_checkpoints and checkpoint_manager:
-            checkpoint_manager.save_checkpoint()
-        
-        # Save progress periodically
-        progress_tracker.save_progress()
-        
-        # Log progress every 10 batches
-        if (batch_num + 1) % 10 == 0:
-            progress_tracker.log_progress()
-        
         # Clean up temp files after every batch to avoid filling up temp space
         if cleanup_temp:
             cleanup_temp_files(temp_dir, aggressive=False)
-    
-    # Final progress save
-    progress_tracker.save_progress(force=True)
-    progress_tracker.log_progress()
     
     # Final aggressive cleanup - remove everything from temp directory
     if cleanup_temp:
@@ -841,9 +542,7 @@ def download_objaverse_xl_robust(
         'errors_encountered': len(tracker.errors_encountered),
         'failed_batches': len(failed_batches),
         'success_rate': len(tracker.found_objects) / total_requested * 100 if total_requested > 0 else 0,
-        'objects_per_second': len(tracker.found_objects) / duration if duration > 0 else 0,
-        'checkpoint_enabled': enable_checkpoints,
-        'resumed_from_checkpoint': enable_checkpoints and len(checkpoint_manager.completed_objects) > 0 if checkpoint_manager else False
+        'objects_per_second': len(tracker.found_objects) / duration if duration > 0 else 0
     }
     
     # Save metadata and reports with job ID
@@ -901,9 +600,6 @@ def download_objaverse_xl_robust(
     logger.info(f"  Failed batches: {summary['failed_batches']}")
     logger.info(f"  Success rate: {summary['success_rate']:.2f}%")
     logger.info(f"  Download speed: {summary['objects_per_second']:.2f} objects/sec")
-    
-    if enable_checkpoints:
-        logger.info(f"  Checkpoint saved with {len(checkpoint_manager.completed_objects)} completed objects")
     
     # Log any problematic objects
     if tracker.problematic_objects:
@@ -987,9 +683,7 @@ def download_objaverse(
     start_offset: int = 0,
     job_id: int = 1,
     download_dir: str = "./objaverse_xl",
-    cleanup_temp: bool = True,
-    min_disk_space_gb: float = 10.0,
-    enable_checkpoints: bool = True
+    cleanup_temp: bool = True
 ):
     """
     Main download function with custom temporary directory support and job array functionality.
@@ -1005,8 +699,6 @@ def download_objaverse(
         job_id: Job ID for distinguishing parallel jobs
         download_dir: Directory to download objects to (permanent storage)
         cleanup_temp: Whether to clean temp directory during and after download
-        min_disk_space_gb: Minimum disk space threshold in GB
-        enable_checkpoints: Whether to enable checkpoint/resume functionality
     """
     if xl:
         logger.info(f"Job {job_id}: Starting Objaverse XL download with robust batch processing")
@@ -1023,9 +715,7 @@ def download_objaverse(
             batch_size=batch_size,
             start_offset=start_offset,
             job_id=job_id,
-            cleanup_temp=cleanup_temp,
-            min_disk_space_gb=min_disk_space_gb,
-            enable_checkpoints=enable_checkpoints
+            cleanup_temp=cleanup_temp
         )
         
         if 'error' in results:
@@ -1119,18 +809,6 @@ if __name__ == "__main__":
         default=None,
         help="Custom base temp directory for manual cleanup. Default: ~/objaverse_temp",
     )
-    parser.add_argument(
-        "--min-disk-space-gb",
-        type=float,
-        default=10.0,
-        help="Minimum disk space threshold in GB. Default: 10.0",
-    )
-    parser.add_argument(
-        "--no-checkpoints",
-        action="store_true",
-        default=False,
-        help="Disable checkpoint/resume functionality. Default: False (checkpoints enabled)",
-    )
     
     args = parser.parse_args()
     
@@ -1153,22 +831,12 @@ if __name__ == "__main__":
             start_offset=args.start_offset,
             job_id=args.job_id,
             download_dir=args.download_dir,
-            cleanup_temp=not args.no_cleanup_temp,
-            min_disk_space_gb=args.min_disk_space_gb,
-            enable_checkpoints=not args.no_checkpoints
+            cleanup_temp=not args.no_cleanup_temp
         )
         exit(0 if success else 1)
     except KeyboardInterrupt:
         logger.info(f"Job {args.job_id}: Download interrupted by user")
-        # Save final checkpoint before exiting
-        if checkpoint_manager:
-            checkpoint_manager.save_checkpoint()
-            logger.info(f"Job {args.job_id}: Checkpoint saved before exit")
         exit(1)
     except Exception as e:
         logger.error(f"Job {args.job_id}: Unexpected error: {e}")
-        # Save final checkpoint before exiting
-        if checkpoint_manager:
-            checkpoint_manager.save_checkpoint()
-            logger.info(f"Job {args.job_id}: Checkpoint saved after error")
         exit(1)

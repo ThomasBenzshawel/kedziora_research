@@ -20,18 +20,9 @@ def setup_logging():
         handlers=[logging.StreamHandler(sys.stdout)]
     )
     return logging.getLogger(__name__)
-
 def scan_directories(scan_dirs, logger):
-    """
-    Scan directories for GLB files and return list of (uid, path) tuples.
-    
-    Args:
-        scan_dirs: List of directory paths to scan
-        logger: Logger object
-    
-    Returns:
-        List of tuples: [(uid, absolute_path_string), ...]
-    """
+    """Scan directories with deduplication"""
+    seen_paths = set()  # Track absolute paths we've already added
     items = []
     
     for scan_dir in scan_dirs:
@@ -45,27 +36,33 @@ def scan_directories(scan_dirs, logger):
         
         logger.info(f"Scanning directory for GLB files: {base_path}")
         start_count = len(items)
+        duplicates = 0
         
         for glb_path in base_path.rglob('*.glb'):
             try:
-                # Create a unique ID based on filename
-                uid = glb_path.stem
+                abs_path_str = str(glb_path.resolve())  # resolve() follows symlinks
                 
-                # Store absolute path as string for JSON serialization
-                items.append((uid, str(glb_path.absolute())))
+                # Skip if we've already seen this exact path
+                if abs_path_str in seen_paths:
+                    duplicates += 1
+                    continue
+                
+                seen_paths.add(abs_path_str)
+                uid = glb_path.stem
+                items.append((uid, abs_path_str))
+                
             except Exception as e:
                 logger.error(f"Failed to process path {glb_path}: {e}")
                 continue
         
         found_in_dir = len(items) - start_count
         logger.info(f"Found {found_in_dir} GLB files in directory: {base_path}")
+        logger.info(f"Skipped {duplicates} duplicate paths (symlinks/overlaps)")
     
-    if len(items) == 0:
-        raise ValueError("No GLB files found in the provided scan directories")
-    
-    logger.info(f"Total GLB files found: {len(items)}")
+    logger.info(f"Total unique GLB files: {len(items)}")
     return items
 
+    
 def main():
     parser = argparse.ArgumentParser(
         description='Scan directories for GLB files and create cached file list'
