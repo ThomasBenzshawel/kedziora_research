@@ -18,8 +18,8 @@
 # ============================================
 TOTAL_WORKERS=7
 FILE_LIST="../voxelize_parallel/logs/glb_file_list.json"
-IMAGES_BASE_DIR="../objaverse_images"
-OUTPUT_DIR="../objaverse_descriptions"
+IMAGES_BASE_DIR="/data/ur/kedziora/layer_x_layer/objaverse_images"
+OUTPUT_DIR="/data/ur/kedziora/layer_x_layer/objaverse_descriptions"
 PYTHON_SCRIPT="llava_parallel_worker.py"
 SAVE_INTERVAL=100
 

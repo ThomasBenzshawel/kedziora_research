@@ -1,17 +1,17 @@
 #!/bin/bash
-#SBATCH --job-name=3d_diffusion_train
+#SBATCH --job-name=layerx_train
 #SBATCH --output=logs/train_%j.out
 #SBATCH --error=logs/train_%j.err
 #SBATCH --nodes=1                    # Single node
 #SBATCH --ntasks-per-node=1          # One task (torchrun will handle multi-GPU)
 #SBATCH --cpus-per-task=64           # CPUs for data loading (adjust based on GPU count)
-#SBATCH --mem=256                 # Memory per node
-#SBATCH --gres=gpu:2                 # Request 4 GPUs (change to 2, 4, 8 as needed)
-#SBATCH --partition=dgx       # GPU partition 
+#SBATCH --mem=256G                   # Memory per node
+#SBATCH --gres=gpu:4                 # Request up to 4 GPUs (change to 2, 4, 8 as needed)
+#SBATCH --partition=dgxh100       # GPU partition 
 #SBATCH --account=undergrad_research
 
 # =============================================================================
-# SLURM Distributed Training Script for 3D Diffusion Model
+# SLURM Distributed Training Script for Layer X Layer Model
 # =============================================================================
 # This script runs distributed training on a single node with multiple GPUs
 # using PyTorch FSDP (Fully Sharded Data Parallel)
@@ -35,11 +35,14 @@ echo "=========================================="
 # Environment Setup
 # =============================================================================
 
+mkdir -p logs
+
 # Initialize conda using miniforge3
 source /usr/local/miniforge3/etc/profile.d/conda.sh
 
 # Activate your conda environment
 conda activate /home/ad.msoe.edu/benzshawelt/.conda/envs/layerxlayer
+
 
 # Verify environment is active
 echo "Active conda environment: $CONDA_DEFAULT_ENV"
@@ -98,20 +101,20 @@ echo "=========================================="
 # =============================================================================
 
 # Training script path
-TRAIN_SCRIPT="train_v3.py"
+TRAIN_SCRIPT="patch_causal_train_v4.py"
 
 # Number of GPUs to use (automatically detected from SLURM)
 NUM_GPUS=$SLURM_GPUS_ON_NODE
 
 # Training arguments
-BATCH_SIZE=4                    # Batch size per GPU
-NUM_EPOCHS=500
+BATCH_SIZE=32                    # Batch size per GPU
 VALIDATION_INTERVAL=10
 CHECKPOINT_INTERVAL=50
 
 # FSDP configuration
 SHARDING_STRATEGY="FULL_SHARD"  # Options: FULL_SHARD, SHARD_GRAD_OP, NO_SHARD
 USE_CPU_OFFLOAD="false"         # Set to "true" if running out of memory
+
 
 echo "=========================================="
 echo "Training Configuration"
@@ -120,7 +123,6 @@ echo "Training script: $TRAIN_SCRIPT"
 echo "Number of GPUs: $NUM_GPUS"
 echo "Batch size per GPU: $BATCH_SIZE"
 echo "Effective batch size: $((BATCH_SIZE * NUM_GPUS))"
-echo "Number of epochs: $NUM_EPOCHS"
 echo "Sharding strategy: $SHARDING_STRATEGY"
 echo "CPU offload: $USE_CPU_OFFLOAD"
 echo "=========================================="
@@ -143,9 +145,10 @@ CMD="torchrun \
     --sharding_strategy $SHARDING_STRATEGY \
     --mixed_precision \
     --batch_size $BATCH_SIZE \
-    --num_epochs $NUM_EPOCHS \
     --validation_interval $VALIDATION_INTERVAL \
-    --checkpoint_interval $CHECKPOINT_INTERVAL"
+    --checkpoint_interval $CHECKPOINT_INTERVAL \
+    --skip_cache_scan
+    "
 
 # Add CPU offload flag if enabled
 if [ "$USE_CPU_OFFLOAD" = "true" ]; then

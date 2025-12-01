@@ -471,66 +471,57 @@ def image_data_augmentation(uid, image_folder, metadata_cache, tokenizer, model,
     
     conv_template = "qwen_1_5"
     
-    comprehensive_question = f"""You are an expert 3D object analyst specializing in voxel modeling and spatial reconstruction.
+    comprehensive_question = f"""You are an expert visual interpreter, specializing in describing objects as voxel-based 3D forms.
 
-    Your task is to analyze these 6 orthogonal views of a {object_name} and create a comprehensive description for voxel-based 3D reconstruction.
+    Your task is to analyze 6 orthogonal views of a 3D object and create a comprehensive description for someone to be able to recreate the object without ever seeing it.
 
-    {DEFAULT_IMAGE_TOKEN} {DEFAULT_IMAGE_TOKEN} {DEFAULT_IMAGE_TOKEN}
-    {DEFAULT_IMAGE_TOKEN} {DEFAULT_IMAGE_TOKEN} {DEFAULT_IMAGE_TOKEN}
-
-    ## Analysis Instructions:
-    Let's think step-by-step through the spatial structure:
-
+    Analysis Instructions:
     1. First, identify the primary geometric forms visible across all views
     2. Cross-reference features between adjacent views to understand 3D relationships
     3. Trace how each component connects through the different perspectives
     4. Build a mental 3D model by integrating all visual information
+    5. Think and write out loud as you analyze the views and think before answering
 
-    ## Output Format (provide ALL sections):
+    These are the views you have:
+    {DEFAULT_IMAGE_TOKEN} {DEFAULT_IMAGE_TOKEN} {DEFAULT_IMAGE_TOKEN}
+    {DEFAULT_IMAGE_TOKEN} {DEFAULT_IMAGE_TOKEN} {DEFAULT_IMAGE_TOKEN}
 
-    **Label:** {object_name} [Revise if the name doesn't accurately describe what you observe]
+    Critical Requirements:
+    Describe the object as a complete 3D form, not as separate images
+    Use spatial reasoning to infer hidden surfaces
+    Prioritize geometric primitives (cubes, cylinders, spheres, etc.)
+    Maintain consistency - if you see a feature in one view, track it through others
+    Be definitive in your descriptions - you are the expert
+    Do NOT mention "images," "views," or "photos"
+    Do NOT describe backgrounds or lighting
+    Do NOT use uncertain language ("appears to be," "might be")
 
-    **Spatial Observations:**
+    Once you are done thinking through the analysis, provide the following structured output, and never start thinking out loud after this point.
+
+    Output Format (You MUST provide ALL sections):
+    Label: {object_name} [Revise if the name doesn't accurately describe what you observe ALLWAYS INFER SOMETHING, NEVER USE A NON-INFORMATIVE NAME]
+
+    Spatial Observations:
     - Front view shows: [key features]
     - Side views reveal: [additional geometry]
     - Top/bottom perspectives indicate: [vertical structure]
     - Cross-view consistency: [how features align across views]
 
-    **Component Hierarchy:**
+    Component Hierarchy:
     PRIMARY: [Main body/structure that forms the core]
     SECONDARY: [Attached or supporting elements]
     DETAILS: [Smaller features, decorative elements]
 
-    **Short Description:** 
+    Short Description: 
     [One precise sentence capturing the object's essential form and function]
-
-    **Long Description:**
+    
+    Long Description:
     [Comprehensive geometric breakdown for voxel reconstruction. Structure your response as:
     - Overall form: The fundamental 3D shape (e.g., cylindrical base with cubic attachments)
     - Component relationships: How parts connect and their relative positions
     - Proportions: Relative sizes without exact measurements (e.g., "handle is approximately 1/3 the height")
-    - Construction sequence: Logical build order from base to details
-    - Symmetry and patterns: Any repeating elements or mirror symmetries
-    Focus ONLY on geometry and spatial relationships. Exclude colors, textures, materials, or environmental context.]
-
-    **Confidence Rating:** [1-10]
-    Justify your rating based on:
-    - Clarity of views: How well you can see all aspects
-    - Feature consistency: How well features align across views
-    - Completeness: Whether any parts are occluded or ambiguous
-
-    ## Critical Requirements:
-    ✓ Describe the object as a complete 3D form, not as separate images
-    ✓ Use spatial reasoning to infer hidden surfaces
-    ✓ Prioritize geometric primitives (cubes, cylinders, spheres, etc.)
-    ✓ Maintain consistency - if you see a feature in one view, track it through others
-    ✓ Be definitive in your descriptions - you are the expert
-    ✗ Do NOT mention "images," "views," or "photos"
-    ✗ Do NOT describe backgrounds or lighting
-    ✗ Do NOT use uncertain language ("appears to be," "might be")
-    ✗ Do NOT mention specific measurements or dimensions
-
-    Remember: Your description will be used by someone who has never seen this object to recreate it in 3D using voxel blocks. Make every detail count for spatial understanding."""
+    - Symmetry and patterns: Any repeating elements or symmetries
+    Focus ONLY on geometry and spatial relationships. Exclude colors, textures, materials, or environmental context.]"""
 
     conv = copy.deepcopy(conv_templates[conv_template])
     conv.append_message(conv.roles[0], comprehensive_question)

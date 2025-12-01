@@ -61,3 +61,4 @@ layer_x_layer/training_from_scratch/data/cifar-10-batches-py/test_batch
 layer_x_layer/training_from_scratch/data/cifar-10-batches-py/readme.html
 *.json
 layer_x_layer/training_from_scratch/t5_cache/embeddings.db
+*.pth

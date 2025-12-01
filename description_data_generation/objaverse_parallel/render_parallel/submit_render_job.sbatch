@@ -36,9 +36,9 @@ export OPENBLAS_NUM_THREADS=1
 # Input paths
 JSON_PATH="/home/ad.msoe.edu/benzshawelt/.objaverse/hf-objaverse-v1/object-paths.json"
 SCAN_DIR="/home/ad.msoe.edu/benzshawelt/.objaverse"
-SCAN_DIR_2="/home/ad.msoe.edu/benzshawelt/objaverse_temp"
-OUTPUT_DIR="../objaverse_images"
-CHECK_DIR="../check_objaverse_images"
+SCAN_DIR_2="/data/ur/kedziora/layer_x_layer/objaverse_xl"
+OUTPUT_DIR="/data/ur/kedziora/layer_x_layer/objaverse_images"
+CHECK_DIR="/data/ur/kedziora/layer_x_layer/objaverse_images_check"
 
 # Job parameters
 TOTAL_CHUNKS=$SLURM_ARRAY_TASK_COUNT

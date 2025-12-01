@@ -4,17 +4,17 @@
 
 # Configuration
 SCAN_DIR="/home/ad.msoe.edu/benzshawelt/.objaverse"
-SCAN_DIR_2="/home/ad.msoe.edu/benzshawelt/objaverse_temp"
-OUTPUT_DIR="../objaverse_voxels"
+SCAN_DIR_2="/data/ur/kedziora/layer_x_layer/objaverse_xl"
+OUTPUT_DIR="/data/ur/kedziora/layer_x_layer/voxels"
 FILE_LIST="logs/glb_file_list.json"
-VOXEL_RESOLUTION=16
-NUM_WORKERS=16
+VOXEL_RESOLUTION=64
+NUM_WORKERS=2
 
 # Create logs directory
 mkdir -p logs
 
 # Check if we should force re-scan
-FORCE_RESCAN=false  # FIXED: was 'fals'
+FORCE_RESCAN=false
 if [ "$1" == "--force" ] || [ "$1" == "-f" ]; then
     FORCE_RESCAN=true
     echo "Force re-scan enabled"
