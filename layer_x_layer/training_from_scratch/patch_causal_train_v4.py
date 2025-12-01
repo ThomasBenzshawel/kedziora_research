@@ -20,7 +20,8 @@ from torch.utils.data.dataloader import default_collate
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.amp import autocast, GradScaler
 
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
@@ -46,8 +47,6 @@ import hashlib
 import sqlite3
 from tqdm import tqdm
 from train_encoder.encoder_training import ResidualBlock3D, LowResContextEncoder
-
-torch.autograd.set_detect_anomaly(True)
 
 
 def initialize_model_weights(model):
@@ -87,6 +86,8 @@ def parse_args():
     # Distributed training / sharding arguments
     parser.add_argument('--shard_model', action='store_true',
                         help='Enable FSDP automatic model sharding across all GPUs')
+    parser.add_argument('--use_ddp', action='store_true',
+                        help='Use DistributedDataParallel instead of FSDP')
     parser.add_argument('--sharding_strategy', type=str, default='FULL_SHARD',
                         choices=['FULL_SHARD', 'SHARD_GRAD_OP', 'NO_SHARD'],
                         help='FSDP sharding strategy (default: FULL_SHARD for max memory savings)')
@@ -130,7 +131,7 @@ def setup_distributed():
     Initialize distributed training environment for FSDP.
     Returns: (is_distributed, rank, world_size, local_rank)
     """
-    if not args.shard_model:
+    if not args.shard_model and not args.use_ddp:
         return False, 0, 1, 0
     
     # Check if launched with torchrun/torch.distributed.launch
@@ -156,7 +157,7 @@ def setup_distributed():
     return True, rank, world_size, local_rank
 
 # GLOBAL VARS
-MASTER_DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+MASTER_DTYPE = torch.float16
 is_distributed, rank, world_size, local_rank = setup_distributed()
 
 # Set device based on distributed mode
@@ -181,8 +182,25 @@ def print_main(*args, **kwargs):
 def get_fsdp_config():
     """
     Get FSDP configuration based on command-line arguments.
-    Returns a dictionary of FSDP parameters.
     """
+    from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+    from torch.distributed.fsdp.wrap import _or_policy, _module_wrap_policy, size_based_auto_wrap_policy
+    from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy, transformer_auto_wrap_policy
+    import functools
+
+    def no_norm_wrap_policy(module):
+        # Never wrap normalization layers directly
+        if isinstance(module, (nn.GroupNorm, nn.LayerNorm, nn.BatchNorm2d)):
+            return False
+        # Wrap these specific module types
+        if isinstance(module, (ResnetBlockWithAttention, FactorizedCausalAttentionParallel)):
+            return True
+        # Also wrap any Sequential with Linear layers
+        if isinstance(module, nn.Sequential) and any(isinstance(m, nn.Linear) for m in module):
+            return True
+        return False
+    
+    
     strategy_map = {
         'FULL_SHARD': ShardingStrategy.FULL_SHARD,
         'SHARD_GRAD_OP': ShardingStrategy.SHARD_GRAD_OP,
@@ -202,27 +220,40 @@ def get_fsdp_config():
     else:
         mixed_precision = None
     
+    # Use transformer-style wrapping - only wrap these specific module types
     auto_wrap_policy = partial(
-        size_based_auto_wrap_policy,
-        min_num_params=1_000_000
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={
+            # Your main blocks
+            ResnetBlockWithAttention,
+            FactorizedCausalAttentionParallel,
+            
+            # Any other custom modules with parameters
+            SinusoidalPosEmb,  # Add this
+            LowResContextEncoder,  # Add if you use it
+            MultiHeadCrossAttention,  # Add if you use it
+            
+            # You may need to add more depending on your code
+        }
     )
     
     config = {
         'sharding_strategy': sharding_strategy,
         'cpu_offload': cpu_offload,
         'mixed_precision': mixed_precision,
-        # 'auto_wrap_policy': auto_wrap_policy,
+        'auto_wrap_policy': None,
         'backward_prefetch': BackwardPrefetch.BACKWARD_PRE,
         'device_id': torch.cuda.current_device(),
         'sync_module_states': True,
-        'use_orig_params': True,  # Prevents view-related autograd errors
+        'use_orig_params': True,
     }
     
     print_main("FSDP Configuration:")
     print_main(f"  Sharding Strategy: {args.sharding_strategy}")
     print_main(f"  CPU Offload: {args.cpu_offload}")
     print_main(f"  Mixed Precision: {args.mixed_precision}")
-    print_main(f"  Use Original Params: True")  # ← Log it
+    print_main(f"  Use Original Params: True")
+    print_main(f"  Wrap Policy: transformer_auto_wrap (ResnetBlockWithAttention, FactorizedCausalAttentionParallel)")
     print_main(f"  World Size: {world_size} GPUs")
     
     return config
@@ -729,9 +760,9 @@ class MultiHeadSelfAttention(nn.Module):
         q, k, v = qkv.chunk(3, dim=1)
         
         # Reshape for multi-head attention
-        q = q.reshape(B, self.num_heads, self.head_dim, H * W).transpose(2, 3)  # [B, heads, HW, head_dim]
-        k = k.reshape(B, self.num_heads, self.head_dim, H * W).transpose(2, 3)
-        v = v.reshape(B, self.num_heads, self.head_dim, H * W).transpose(2, 3)
+        q = q.view(B, self.num_heads, self.head_dim, H * W).transpose(2, 3)  # [B, heads, HW, head_dim]
+        k = k.view(B, self.num_heads, self.head_dim, H * W).transpose(2, 3)
+        v = v.view(B, self.num_heads, self.head_dim, H * W).transpose(2, 3)
         
         # Scaled dot-product attention
         scale = self.head_dim ** -0.5
@@ -741,7 +772,7 @@ class MultiHeadSelfAttention(nn.Module):
         
         # Apply attention to values
         out = torch.matmul(attn, v)  # [B, heads, HW, head_dim]
-        out = out.transpose(2, 3).reshape(B, C, H, W).contiguous()
+        out = out.transpose(2, 3).contiguous().view(B, C, H, W)
         
         # Project and add residual
         out = self.proj(out)
@@ -777,16 +808,16 @@ class MultiHeadCrossAttention(nn.Module):
         
         # Query from spatial features
         q = self.q(h)  # [B, C, H, W]
-        q = q.reshape(B, self.num_heads, self.head_dim, H * W)
-        q = q.permute(0, 1, 3, 2).contiguous()  # [B, heads, HW, head_dim]
+        q = q.view(B, self.num_heads, self.head_dim, H * W)
+        q = q.permute(0, 1, 3, 2)  # [B, heads, HW, head_dim]
         
         # Project context sequence to key and value
         seq_len = context.shape[1]
         kv = self.to_kv(context)  # [B, seq_len, channels * 2]
-        kv = kv.reshape(B, seq_len, 2, self.num_heads, self.head_dim)
+        kv = kv.view(B, seq_len, 2, self.num_heads, self.head_dim)
         k, v = kv[:, :, 0], kv[:, :, 1]  # Each is [B, seq_len, num_heads, head_dim]
-        k = k.permute(0, 2, 1, 3).contiguous()  # [B, num_heads, seq_len, head_dim]
-        v = v.permute(0, 2, 1, 3).contiguous()
+        k = k.permute(0, 2, 1, 3)  # [B, num_heads, seq_len, head_dim]
+        v = v.permute(0, 2, 1, 3)
         
         # Compute attention
         scale = self.head_dim ** -0.5
@@ -798,7 +829,7 @@ class MultiHeadCrossAttention(nn.Module):
         
         # Reshape back to spatial
         out = out.permute(0, 1, 3, 2).contiguous()
-        out = out.reshape(B, C, H, W)
+        out = out.view(B, C, H, W)
         
         # Output projection and residual
         out = self.proj(out)
@@ -850,14 +881,11 @@ class ResnetBlockWithAttention(nn.Module):
                  layer_context_dim=64, use_attention=False, num_heads=8, num_groups=8):
         super().__init__()
         
-        # Combined conditioning dimension (time + layer context)
-        cond_dim = time_emb_dim + layer_context_dim
-        
-        # AdaGN layers that condition on BOTH time and layer
-        self.norm1 = AdaGN(num_groups, in_channels, cond_dim)
+        # AdaGN layers that condition on time 
+        self.norm1 = AdaGN(num_groups, in_channels, time_emb_dim)
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
         
-        self.norm2 = AdaGN(num_groups, out_channels, cond_dim)
+        self.norm2 = AdaGN(num_groups, out_channels, time_emb_dim)
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
         
         self.activation = nn.SiLU()
@@ -880,21 +908,14 @@ class ResnetBlockWithAttention(nn.Module):
         context_emb: [B, seq_len, context_dim] - text/context embeddings for attention
         """
         # Combine time and layer context for conditioning
-        if layer_context is not None:
-            cond = torch.cat([t, layer_context], dim=-1)  # [B, time_emb_im + layer_context_dim]
-        else:
-            # If no layer context, pad with zeros
-            layer_zeros = torch.zeros(t.shape[0], self.norm1.scale_shift.in_features - t.shape[1], 
-                                     device=t.device, dtype=t.dtype)
-            cond = torch.cat([t, layer_zeros], dim=-1)
         
         # First ResNet block: norm -> activation -> conv
-        h = self.norm1(x, cond)
+        h = self.norm1(x, t)
         h = self.activation(h)
         h = self.conv1(h)
         
         # Second ResNet block: norm -> activation -> conv
-        h = self.norm2(h, cond)
+        h = self.norm2(h, t)
         h = self.activation(h)
         h = self.conv2(h)
         
@@ -1030,8 +1051,8 @@ class ForwardDiffusion():
                 dtype = torch.float16
             noise = torch.randn_like(x0).to(dtype=MASTER_DTYPE)
 
-        sqrt_alpha_hat = self.sqrt_alpha_hats[t].reshape(-1, 1, 1, 1).to(x0.device)
-        sqrt_one_minus_alpha_hat = self.sqrt_one_minus_alpha_hats[t].reshape(-1, 1, 1, 1).to(x0.device)
+        sqrt_alpha_hat = self.sqrt_alpha_hats[t].view(-1, 1, 1, 1).to(x0.device)
+        sqrt_one_minus_alpha_hat = self.sqrt_one_minus_alpha_hats[t].view(-1, 1, 1, 1).to(x0.device)
         
         xt = sqrt_alpha_hat * x0 + sqrt_one_minus_alpha_hat * noise
         return xt, noise
@@ -1131,7 +1152,7 @@ class MultiLayerCrossAttentionBlock(nn.Module):
         # Get query from current layer
         q = self.norm_q(x)
         q = self.to_q(q)
-        q = q.reshape(B, self.num_heads, self.head_dim, H * W)
+        q = q.view(B, self.num_heads, self.head_dim, H * W)
         q = q.permute(0, 1, 3, 2)  # [B, num_heads, HW, head_dim]
         
         # Process all previous layers
@@ -1142,19 +1163,19 @@ class MultiLayerCrossAttentionBlock(nn.Module):
         v = self.to_v(prev_layers_norm)
         
         # Reshape for multi-head attention
-        k = k.reshape(B, N, self.num_heads, self.head_dim, H * W)
-        k = k.permute(0, 2, 1, 4, 3).reshape(B, self.num_heads, N * H * W, self.head_dim).contiguous()
+        k = k.view(B, N, self.num_heads, self.head_dim, H * W)
+        k = k.permute(0, 2, 1, 4, 3).reshape(B, self.num_heads, N * H * W, self.head_dim)
         
-        v = v.reshape(B, N, self.num_heads, self.head_dim, H * W)
-        v = v.permute(0, 2, 1, 4, 3).reshape(B, self.num_heads, N * H * W, self.head_dim).contiguous()
+        v = v.view(B, N, self.num_heads, self.head_dim, H * W)
+        v = v.permute(0, 2, 1, 4, 3).reshape(B, self.num_heads, N * H * W, self.head_dim)
         
         # Add positional encodings
         if layer_positions is not None:
             pos_emb = self.layer_pos_proj(layer_positions)
-            pos_emb = pos_emb.reshape(B, N, self.num_heads, self.head_dim).contiguous()
-            pos_emb = pos_emb.permute(0, 2, 1, 3).contiguous()
-            pos_emb = pos_emb.unsqueeze(3).repeat(1, 1, 1, H * W, 1)
-            pos_emb = pos_emb.reshape(B, self.num_heads, N * H * W, self.head_dim).contiguous()
+            pos_emb = pos_emb.view(B, N, self.num_heads, self.head_dim)
+            pos_emb = pos_emb.permute(0, 2, 1, 3)
+            pos_emb = pos_emb.unsqueeze(3).expand(-1, -1, -1, H * W, -1)
+            pos_emb = pos_emb.reshape(B, self.num_heads, N * H * W, self.head_dim)
             k = k + pos_emb
         
         # Compute attention
@@ -1166,7 +1187,7 @@ class MultiLayerCrossAttentionBlock(nn.Module):
             device = attn.device
             
             # Previous layer indices: [0, 1, 2, ..., N-1]
-            prev_indices = torch.arange(N, device=device).unsqueeze(0).repeat(B, 1)  # [B, N]
+            prev_indices = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)  # [B, N]
             
             # Compute relative distances from current layer to each previous layer
             relative_distances = current_layer_idx.unsqueeze(1) - prev_indices  # [B, N]
@@ -1185,7 +1206,7 @@ class MultiLayerCrossAttentionBlock(nn.Module):
             # Each spatial position gets the same layer-level bias
             bias = bias.unsqueeze(2)  # [B, num_heads, 1, N]
             bias = bias.repeat(1, 1, H * W, 1)  # [B, num_heads, HW, N]
-            bias = bias.unsqueeze(-1).repeat(1, 1, 1, 1, H * W)  # [B, num_heads, HW, N, HW]
+            bias = bias.unsqueeze(-1).expand(-1, -1, -1, -1, H * W)  # [B, num_heads, HW, N, HW]
             bias = bias.reshape(B, self.num_heads, H * W, N * H * W)  # [B, num_heads, HW, N*HW]
             
             # Add bias to attention scores
@@ -1195,7 +1216,7 @@ class MultiLayerCrossAttentionBlock(nn.Module):
         
         # Apply attention to values
         out = torch.matmul(attn, v)
-        out = out.permute(0, 1, 3, 2).reshape(B, C, H, W).contiguous()
+        out = out.permute(0, 1, 3, 2).contiguous().view(B, C, H, W)
         
         # Output projection and residual
         out = self.to_out(out)
@@ -1264,8 +1285,8 @@ class CausalLayerAttention(nn.Module):
         k = self.to_k(self.norm_k(k_pooled))  # [B, L, C]
         
         # Reshape for multi-head attention
-        q = q.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)  # [B, heads, L, head_dim]
-        k = k.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)  # [B, heads, L, head_dim]
+        q = q.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)  # [B, heads, L, head_dim]
+        k = k.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)  # [B, heads, L, head_dim]
         
         # Compute attention scores
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B, heads, L, L]
@@ -1355,9 +1376,9 @@ class SpatialCrossAttention(nn.Module):
         v = self.to_v(self.norm_kv(context_features))  # [B, C, H, W]
         
         # Reshape for attention: [B, num_heads, H*W, head_dim]
-        q = q.reshape(B, self.num_heads, self.head_dim, H * W).permute(0, 1, 3, 2) # [B, num_heads, H*W, head_dim]
-        k = k.reshape(B, self.num_heads, self.head_dim, H * W).permute(0, 1, 3, 2) # [B, num_heads, H*W, head_dim]
-        v = v.reshape(B, self.num_heads, self.head_dim, H * W).permute(0, 1, 3, 2)  # [B, num_heads, H*W, head_dim]
+        q = q.view(B, self.num_heads, self.head_dim, H * W).permute(0, 1, 3, 2)
+        k = k.view(B, self.num_heads, self.head_dim, H * W).permute(0, 1, 3, 2)
+        v = v.view(B, self.num_heads, self.head_dim, H * W).permute(0, 1, 3, 2)
         
         # Attention: [B, heads, H*W, H*W]
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
@@ -1366,7 +1387,7 @@ class SpatialCrossAttention(nn.Module):
         
         # Apply attention to values
         out = torch.matmul(attn, v)  # [B, heads, H*W, head_dim]
-        out = out.permute(0, 1, 3, 2).reshape(B, C, H, W).contiguous() # [B, C, H, W]
+        out = out.permute(0, 1, 3, 2).contiguous().view(B, C, H, W)
         
         out = self.to_out(out)
         return out
@@ -1546,9 +1567,9 @@ class FactorizedCausalAttentionParallel(nn.Module):
         k = self.layer_k(self.layer_norm_k(k_pool))  # [B, L, C]
         
         # Multi-head reshape
-        q = q.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-        k = k.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-                
+        q = q.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        
         # Attention scores
         scale = self.head_dim ** -0.5
         attn = torch.matmul(q, k.transpose(-2, -1)) * scale
@@ -1567,12 +1588,12 @@ class FactorizedCausalAttentionParallel(nn.Module):
         B, L, C, H, W = x_clean.shape
         
         # Flatten spatial
-        x_flat = x_clean.reshape(B, L, -1) # [B, L, C*H*W]
+        x_flat = x_clean.view(B, L, -1)  # [B, L, C*H*W]
         
         # Weighted sum
         context = torch.bmm(layer_weights, x_flat)  # [B, L, C*H*W]
         
-        return context.reshape(B, L, C, H, W).contiguous()
+        return context.view(B, L, C, H, W)
     
     def spatial_attention(self, query, context):
         """Apply spatial cross-attention."""
@@ -1590,9 +1611,9 @@ class FactorizedCausalAttentionParallel(nn.Module):
         v = self.spatial_v(self.spatial_norm_kv(context))
         
         # Reshape for attention
-        q = q.reshape(B_L, self.num_heads, self.head_dim, -1).permute(0, 1, 3, 2).contiguous()
-        k = k.reshape(B_L, self.num_heads, self.head_dim, -1).permute(0, 1, 3, 2).contiguous()
-        v = v.reshape(B_L, self.num_heads, self.head_dim, -1).permute(0, 1, 3, 2).contiguous()
+        q = q.view(B_L, self.num_heads, self.head_dim, -1).permute(0, 1, 3, 2)
+        k = k.view(B_L, self.num_heads, self.head_dim, -1).permute(0, 1, 3, 2)
+        v = v.view(B_L, self.num_heads, self.head_dim, -1).permute(0, 1, 3, 2)
         
         # Attention
         scale = self.head_dim ** -0.5
@@ -1601,7 +1622,7 @@ class FactorizedCausalAttentionParallel(nn.Module):
         attn = self.dropout(attn)
         
         out = torch.matmul(attn, v)
-        out = out.permute(0, 1, 3, 2).reshape(B_L, C, H, W).contiguous()
+        out = out.permute(0, 1, 3, 2).contiguous().view(B_L, C, H, W)
         
         return self.spatial_out(out)
     
@@ -1624,9 +1645,9 @@ class FactorizedCausalAttentionParallel(nn.Module):
         context = self.aggregate_context(layer_weights, x_clean)  # [B, L, C, H, W]
         
         # Step 3: Spatial attention (batched over layers)
-        x_noisy_flat = x_noisy.reshape(B * L, C, H, W).contiguous()  # Use reshape + contiguous
-        context_flat = context.reshape(B * L, C, H, W).contiguous()
-            
+        x_noisy_flat = x_noisy.view(B * L, C, H, W)
+        context_flat = context.view(B * L, C, H, W)
+        
         if self.chunk_size is not None and L > self.chunk_size:
             # Process in chunks for memory efficiency
             outputs = []
@@ -1640,7 +1661,7 @@ class FactorizedCausalAttentionParallel(nn.Module):
         else:
             spatial_out = self.spatial_attention(x_noisy_flat, context_flat)
         
-        spatial_out = spatial_out = spatial_out.reshape(B, L, C, H, W).contiguous()
+        spatial_out = spatial_out.view(B, L, C, H, W)
         
         # Residual with scaling
         return x_noisy + self.output_scale.squeeze() * spatial_out #squeeze because 0D can't be sharded, so we put it to a 1D and need to squeeze here
@@ -1780,7 +1801,7 @@ class LayerXLayerDiffusionModelV4(nn.Module):
         x = x.to(model_dtype)
         
         # Combine layer position with text context
-        layer_pos_expanded = layer_pos.unsqueeze(1).repeat(1, context.shape[1], 1)
+        layer_pos_expanded = layer_pos.unsqueeze(1).expand(-1, context.shape[1], -1)
         combined_context = torch.cat([layer_pos_expanded, context], dim=-1)
         context = self.layer_context_conditioning_mlp(combined_context)
         
@@ -1862,17 +1883,15 @@ class LayerXLayerDiffusionModelV4(nn.Module):
         B, L, C, H, W = x_noisy_all.shape
         device = x_noisy_all.device
         model_dtype = next(self.parameters()).dtype
-        context = context.clone().to(model_dtype)
         
         # Get layer positional embeddings
         layer_indices = torch.arange(L, device=device, dtype=model_dtype)
         layer_pos_all = self.layer_pos_emb(layer_indices)  # [L, layer_context_dim]
-        layer_pos_all = layer_pos_all.unsqueeze(0).repeat(B, 1, 1).contiguous() # [B, L, layer_context_dim]
+        layer_pos_all = layer_pos_all.unsqueeze(0).expand(B, -1, -1)  # [B, L, layer_context_dim]
         
         # Expand and combine text context with layer position
-        context_expanded = context.unsqueeze(1).repeat(1, L, 1, 1).contiguous() # [B, L, seq_len, text_dim]
-        layer_pos_for_context = layer_pos_all.unsqueeze(2).repeat(1, 1, context.shape[1], 1).contiguous()
-
+        context_expanded = context.unsqueeze(1).expand(-1, L, -1, -1)  # [B, L, seq_len, text_dim]
+        layer_pos_for_context = layer_pos_all.unsqueeze(2).expand(-1, -1, context.shape[1], -1)
         combined_context = torch.cat([layer_pos_for_context, context_expanded], dim=-1)
         combined_context_flat = combined_context.reshape(B * L, context.shape[1], -1)
         context_processed = self.layer_context_conditioning_mlp(combined_context_flat)
@@ -1896,7 +1915,7 @@ class LayerXLayerDiffusionModelV4(nn.Module):
             if self.current_low_res_layer_context:
                 low_res_flat = low_res_features.reshape(B * L, 1, -1)
             else:
-                low_res_expanded = low_res_features.unsqueeze(1).repeat(1, L, 1, 1)
+                low_res_expanded = low_res_features.unsqueeze(1).expand(-1, L, -1, -1)
                 low_res_flat = low_res_expanded.reshape(B * L, L, -1)
             
             h_flat = self.low_res_cross_attn(h_flat, low_res_flat)
@@ -2031,8 +2050,8 @@ class LayerXLayerDiffusionTrainerV4:
         x_noisy = torch.zeros_like(all_layers)
         for l in range(L):
             t_l = t_all[:, l]
-            sqrt_alpha = self.diffusion.sqrt_alpha_hats[t_l].reshape(B, 1, 1, 1).to(model_dtype)
-            sqrt_one_minus = self.diffusion.sqrt_one_minus_alpha_hats[t_l].reshape(B, 1, 1, 1).to(model_dtype)
+            sqrt_alpha = self.diffusion.sqrt_alpha_hats[t_l].view(B, 1, 1, 1).to(model_dtype)
+            sqrt_one_minus = self.diffusion.sqrt_one_minus_alpha_hats[t_l].view(B, 1, 1, 1).to(model_dtype)
             x_noisy[:, l] = sqrt_alpha * all_layers[:, l] + sqrt_one_minus * noise[:, l]
         
         low_res_features = None
@@ -2042,17 +2061,28 @@ class LayerXLayerDiffusionTrainerV4:
                     low_res_context.to(model_dtype), L
                 ).detach()
         
-        predicted_noise = self.model.forward_parallel(
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        predicted_noise = model.forward_parallel(
             x_noisy, t_all, context.to(model_dtype), all_layers,
             low_res_features=low_res_features
         )
-        
-        loss = F.mse_loss(predicted_noise.float(), noise.float())
+        if args.use_ddp and args.mixed_precision:
+            with autocast(dtype=torch.bfloat16, device_type='cuda'):
+                loss = F.mse_loss(predicted_noise.float(), noise.float())
+        else:
+            loss = F.mse_loss(predicted_noise.float(), noise.float())
         
         if backward:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
-            self.optimizer.step()
+            if args.use_ddp and args.mixed_precision:
+                scaler.scale(loss).backward()
+                scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+                scaler.step(self.optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+                self.optimizer.step()
             if self.scheduler is not None:
                 self.scheduler.step()
         
@@ -2108,13 +2138,17 @@ class LayerXLayerDiffusionTrainerV4:
                 prev_layers = None
             
             # Forward pass (single layer)
-            predicted_noise = self.model(xt, t, l, context, prev_layers, 
+            model = self.model.module if hasattr(self.model, 'module') else self.model
+            predicted_noise = model(xt, t, l, context, prev_layers, 
                                         low_res_features=low_res_features)
-            
+                
             loss = F.mse_loss(predicted_noise.float(), noise.float())
             
             if backward:
-                loss.backward()
+                if args.use_ddp and args.mixed_precision:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
                 total_loss += loss.item()
                 del loss, predicted_noise, xt, noise
             else:
@@ -2125,7 +2159,7 @@ class LayerXLayerDiffusionTrainerV4:
                 prev_layers_list.append(current_layer.detach())
             else:
                 # Use model's prediction (more realistic but harder to train)
-                alpha_hat_t = self.diffusion.alpha_hats[t].reshape(-1, 1, 1, 1)
+                alpha_hat_t = self.diffusion.alpha_hats[t].view(-1, 1, 1, 1)
                 denoised = (xt - torch.sqrt(1 - alpha_hat_t) * predicted_noise) / torch.sqrt(alpha_hat_t)
                 prev_layers_list.append(denoised.detach())
         
@@ -2170,7 +2204,8 @@ class LayerXLayerDiffusionTrainerV4:
                 
                 for i, t in enumerate(ddim_timesteps):
                     t_batch = torch.full((batch_size,), t, device=device, dtype=model_dtype)
-                    predicted_noise = self.model(x, t_batch, l, context, prev_layers)
+                    model = self.model.module if hasattr(self.model, 'module') else self.model
+                    predicted_noise = model(x, t_batch, l, context, prev_layers)
                     
                     # DDIM update rule
                     alpha_hat_t = self.diffusion.alpha_hats[t]
@@ -2657,7 +2692,7 @@ class FSDPProgressiveGranularityTrainer:
         # Load checkpoint
         checkpoint = torch.load(checkpoint_path, map_location=device)
         
-        # Strip _orig_mod. prefix if present (from torch.compile)
+        # Strip _orig_mod. prefix if present (from compiling)
         state_dict = checkpoint['model_state_dict']
         if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
             state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
@@ -2854,7 +2889,7 @@ class FSDPProgressiveGranularityTrainer:
             # Run diffusion to convergence
             for t in reversed(range(diffusion.timesteps)):
                 t_batch = torch.full((batch_size,), t, dtype=MASTER_DTYPE, device=device)
-                
+                model = self.model.module if hasattr(self.model, 'module') else self.model
                 predicted_noise = model(
                     x, t_batch, l, context, prev_layers,
                     low_res_features=low_res_contexts
@@ -2953,8 +2988,12 @@ class FSDPProgressiveGranularityTrainer:
             fsdp_config = get_fsdp_config()
             model = FSDP(model, **fsdp_config)
 
-        # model = torch.compile(model, mode='max-autotune', fullgraph=True)
+        elif args.use_ddp:
+            print_main("Wrapping model with DDP")
+            model = DDP(model, device_ids=[device])
 
+        # model = torch.compile(model, mode='max-autotune', fullgraph=True)
+        
         print_main("✓ Model created and compiled")
         print_main("Model has", sum(p.numel() for p in model.parameters()), "parameters")
 
@@ -3005,6 +3044,9 @@ class FSDPProgressiveGranularityTrainer:
             
             if rank == 0:
                 print(f"Training Loss: {epoch_loss:.4f}")
+                # count wrapped units
+                fsdp_units = sum(1 for m in model.modules() if isinstance(m, FSDP))
+                print(f"Number of FSDP units: {fsdp_units}")
             
             # Calculate global epoch for plotting
             global_epoch_offset = sum([len(self.metrics_history['stages'][i]['train_loss']) 
@@ -3526,6 +3568,7 @@ class TrainingVoxelVisualizer:
                     t_batch = torch.full((batch_size,), t, device=device, dtype=model_dtype)
                     if len(generated_layers) > 0:
                         prev_layer_features = torch.stack(generated_layers, dim=1)
+                    model = trainer.model.module if hasattr(trainer.model, 'module') else trainer.model
                     predicted_noise = trainer.model(
                         x, t_batch, l, context, prev_layer_features
                     )
@@ -3706,7 +3749,8 @@ print_main("✓ T5 embeddings cached! Training will use cached embeddings for sp
 progressive_trainer = FSDPProgressiveGranularityTrainer(
     granularities=granularities
 )
-
+if args.use_ddp and args.mixed_precision:
+    scaler = GradScaler('cuda')
 # KICK OFF THE BIG TRAINING RUN and START TRAINING!
 results = progressive_trainer.train_all_stages(
     epochs_per_stage=epochs_per_stage,  # Epochs for 16³, 32³, 64³

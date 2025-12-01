@@ -107,7 +107,7 @@ TRAIN_SCRIPT="patch_causal_train_v4.py"
 NUM_GPUS=$SLURM_GPUS_ON_NODE
 
 # Training arguments
-BATCH_SIZE=32                    # Batch size per GPU
+BATCH_SIZE=512                  # Batch size per GPU
 VALIDATION_INTERVAL=10
 CHECKPOINT_INTERVAL=50
 
@@ -141,9 +141,7 @@ CMD="torchrun \
     --master_addr=$MASTER_ADDR \
     --master_port=$MASTER_PORT \
     $TRAIN_SCRIPT \
-    --shard_model \
-    --sharding_strategy $SHARDING_STRATEGY \
-    --mixed_precision \
+    --use_ddp \
     --batch_size $BATCH_SIZE \
     --validation_interval $VALIDATION_INTERVAL \
     --checkpoint_interval $CHECKPOINT_INTERVAL \
