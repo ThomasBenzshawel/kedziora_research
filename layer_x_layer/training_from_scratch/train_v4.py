@@ -62,7 +62,7 @@ def initialize_model_weights(model):
                 nn.init.zeros_(m.bias)
         elif isinstance(m, nn.Linear):
             # Xavier for linear layers with small gain for stability
-            nn.init.xavier_uniform_(m.weight, gain=0.02)
+            nn.init.xavier_uniform_(m.weight, gain=0.5)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
         elif isinstance(m, (nn.GroupNorm, nn.LayerNorm, nn.BatchNorm2d)):
@@ -96,7 +96,7 @@ def parse_args():
     # Training hyperparameters
     parser.add_argument('--num_epochs', type=int, default=500,
                         help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=None,
+    parser.add_argument('--batch_size', type=int, default=128,
                         help='Override batch size (per GPU)')
     parser.add_argument('--learning_rate', type=float, default=None,
                         help='Override learning rate')
@@ -108,6 +108,8 @@ def parse_args():
                     help='Use only current layer low-res context (vs all layers)')
     parser.add_argument('--enable_fuzzy_matching', action='store_true',
         help='Enable fuzzy matching for missing descriptions (slower initialization)')
+    parser.add_argument('--skip_cache_scan', action='store_true',
+        help='Skip scanning datasets for uncached T5 embeddings (use when cache is complete)')
 
     return parser.parse_args()
 
@@ -225,6 +227,8 @@ def get_fsdp_config():
     
     return config
 
+# training dtype
+MASTER_DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
 # %%
 # ========== T5 EMBEDDING CACHE ==========
@@ -249,6 +253,8 @@ class T5EmbeddingCache:
         self.max_length = max_length
         self.db_path = self.cache_dir / 'embeddings.db'
         self.memory_cache_size = memory_cache_size
+        self.tokenizer = None
+        self.model = None
         
         # Small LRU cache for frequently accessed embeddings
         self._memory_cache = {}
@@ -335,22 +341,13 @@ class T5EmbeddingCache:
         print(f"Database contains {count:,} cached embeddings")
     
     def get_embedding(self, text):
-        """
-        Get embedding from cache (memory -> disk).
-        
-        Args:
-            text: Text string to get embedding for
-            
-        Returns:
-            torch.Tensor or None: Cached embedding [max_length, 768] or None if not found
-        """
         key = self._get_cache_key(text)
         
-        # Check memory cache first (fast path)
+        # Check memory cache first
         if key in self._memory_cache:
             return self._memory_cache[key]
         
-        # Check disk cache (slower path)
+        # Check disk cache
         conn = sqlite3.connect(str(self.db_path))
         cursor = conn.cursor()
         cursor.execute('SELECT embedding FROM embeddings WHERE text_hash = ?', (key,))
@@ -358,17 +355,43 @@ class T5EmbeddingCache:
         conn.close()
         
         if result is not None:
-            # Deserialize from database
             embedding = torch.from_numpy(
-                np.frombuffer(result[0], dtype=np.float16).reshape(self.max_length, 768)
-            )
-            
-            # Add to memory cache for future access
+            np.frombuffer(result[0], dtype=np.float16).reshape(self.max_length, 768).copy()
+        )
             self._add_to_memory_cache(key, embedding)
             return embedding
         
-        return None
-    
+        # CACHE MISS - compute on-the-fly
+        print(f"Cache miss for text: {text[:50]}...")
+        if self.model is None or self.tokenizer is None:
+            return None
+        else:
+            model_device = next(self.model.parameters()).device
+            
+            # Send inputs to the SAME device as the model
+            text_input = self.tokenizer(
+                text,
+                padding='max_length',
+                max_length=self.max_length,
+                truncation=True,
+                return_tensors='pt'
+            ).to(model_device)
+                    
+            embedding = self.model(
+                input_ids=text_input.input_ids,
+                attention_mask=text_input.attention_mask
+            ).last_hidden_state
+            
+            # Cache and return (will be on CPU after add_embedding)
+            self.add_embedding(text, embedding.squeeze(0))
+            
+            # Cleanup
+            del text_input
+
+            embedding_cpu = embedding.squeeze(0).cpu()
+
+            return embedding_cpu
+
     def add_embedding(self, text, embedding):
         """
         Add embedding to cache (both disk and memory).
@@ -380,7 +403,7 @@ class T5EmbeddingCache:
         key = self._get_cache_key(text)
         
         # Serialize to bytes (float16 for space efficiency)
-        embedding_bytes = embedding.cpu().numpy().astype(np.float16).tobytes()
+        embedding_bytes = embedding.cpu().detach().numpy().astype(np.float16).tobytes()
         
         # Write to disk
         conn = sqlite3.connect(str(self.db_path))
@@ -414,7 +437,7 @@ class T5EmbeddingCache:
         
         for idx in tqdm(range(len(dataset)), desc="Scanning for uncached descriptions"):
             # Load just the description (lazy loading)
-            _, description = dataset[idx]
+            _, description, file_idx = dataset[idx]
             
             # Check if already cached
             if self.get_embedding(description) is None:
@@ -538,15 +561,9 @@ class T5EmbeddingCache:
             if emb is None:
                 raise ValueError(f"Embedding not found in cache for text: {text[:50]}...")
             embeddings.append(emb)
-        
-        # Determine dtype based on environment
-        if torch.cuda.is_available():
-            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        else:
-            dtype = torch.float16
-        
-        return torch.stack(embeddings).to(device, dtype=dtype)
-    
+
+        return torch.stack(embeddings).to(device, dtype=MASTER_DTYPE)
+
     def clear_memory_cache(self):
         """Clear the in-memory LRU cache (keeps disk cache intact)"""
         self._memory_cache.clear()
@@ -592,6 +609,35 @@ class T5EmbeddingCache:
         print(f"Memory cache capacity:        {stats['memory_cache_size']:,}")
         print(f"Database path:                {stats['database_path']}")
         print("="*60 + "\n")
+
+    def set_embedding_model(self, model, tokenizer):
+        """Set the T5 model used for embedding computation (for API compatibility)"""
+        self.model = model
+        self.tokenizer = tokenizer
+
+def load_pretrained_encoder(model, encoder_checkpoint_path):
+    """Load pretrained encoder weights into the model"""
+    checkpoint = torch.load(encoder_checkpoint_path, map_location='cpu')
+    encoder_state_dict = checkpoint['encoder_state_dict']
+    
+    # Strip _orig_mod. prefix if present
+    if any(k.startswith('_orig_mod.') for k in encoder_state_dict.keys()):
+        encoder_state_dict = {
+            k.replace('_orig_mod.', ''): v 
+            for k, v in encoder_state_dict.items()
+        }
+    
+    # Load into model's low_res_encoder
+    model.low_res_encoder.load_state_dict(encoder_state_dict, strict=True)
+    
+    #freeze the encoder
+    for param in model.low_res_encoder.parameters():
+        param.requires_grad = False
+    
+    print(f"✓ Loaded pretrained encoder from {encoder_checkpoint_path}")
+    print("  Encoder weights frozen for training")
+    
+    return model
 
 # %%
 # ========== VALIDATION METRICS ==========
@@ -799,8 +845,7 @@ class AdaGN(nn.Module):
     
     def forward(self, x, cond):
         x = self.norm(x)
-        # Clone before chunking to avoid CUDA Graphs conflict
-        scale_shift_out = self.scale_shift(cond).clone()
+        scale_shift_out = self.scale_shift(cond)
         scale, shift = scale_shift_out.chunk(2, dim=-1)
         return x * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
 
@@ -875,10 +920,10 @@ class SinusoidalPosEmb(nn.Module):
 
     def forward(self, x):
         device = x.device
-        dtype = x.dtype  
+        model_dtype = x.dtype
         half_dim = self.dim // 2
         emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device, dtype=dtype) * -emb)
+        emb = torch.exp(torch.arange(half_dim, device=device, dtype=model_dtype) * -emb)
         emb = x[:, None] * emb[None, :]
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
         if self.dim % 2 == 1:  # zero pad
@@ -927,7 +972,7 @@ class ExponentialMovingAverage:
 # forward diffusion that creates a corrupted input
 
 class ForwardDiffusion():
-    def __init__(self, timesteps=1000, beta_start=1e-4, beta_end=0.02, schedule='cosine'):
+    def __init__(self, timesteps=250, beta_start=1e-4, beta_end=0.02, schedule='cosine'):
         """
         Initialize forward diffusion process with configurable beta schedule.
         
@@ -991,13 +1036,13 @@ class ForwardDiffusion():
         
         return betas
 
-    def forward(self, x0, t, noise=None, dtype=torch.float32):
+    def forward(self, x0, t, noise=None):
         if noise is None:
             if is_distributed:
                 dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
             else:
                 dtype = torch.float16
-            noise = torch.randn_like(x0).to(dtype=dtype)
+            noise = torch.randn_like(x0).to(dtype=MASTER_DTYPE)
 
         sqrt_alpha_hat = self.sqrt_alpha_hats[t].view(-1, 1, 1, 1).to(x0.device)
         sqrt_one_minus_alpha_hat = self.sqrt_one_minus_alpha_hats[t].view(-1, 1, 1, 1).to(x0.device)
@@ -1104,7 +1149,7 @@ class MultiLayerCrossAttentionBlock(nn.Module):
         q = q.permute(0, 1, 3, 2)  # [B, num_heads, HW, head_dim]
         
         # Process all previous layers
-        prev_layers_flat = prev_layers.view(B * N, C, H, W)
+        prev_layers_flat = prev_layers.reshape(B * N, C, H, W)
         prev_layers_norm = self.norm_kv(prev_layers_flat)
         
         k = self.to_k(prev_layers_norm)
@@ -1247,6 +1292,14 @@ class LayerXLayerDiffusionModelV2(nn.Module):
                 context_dim=128,  # From low_res_encoder
                 num_heads=4
             )
+
+            # load the low-res encoder weights if available
+            # Note: This assumes the LowResContextEncoder has been properly trained and saved
+
+            # freeze the low-res encoder weights
+
+            for param in self.low_res_encoder.parameters():
+                param.requires_grad = False
     
 
         # Input
@@ -1296,7 +1349,7 @@ class LayerXLayerDiffusionModelV2(nn.Module):
         # Output
         self.output_conv = nn.Conv2d(model_channels, in_channels, 3, padding=1)
 
-    def forward(self, x, t, l, context, prev_layers=None, low_res_context=None):
+    def forward(self, x, t, l, context, prev_layers=None, low_res_context=None, low_res_features=None):
         """
         Forward pass with cross-attention to all previous layers.
         
@@ -1306,7 +1359,8 @@ class LayerXLayerDiffusionModelV2(nn.Module):
             l: [B] - layer index (0 to granularity-1)
             context: [B, text_context_dim] - text embeddings
             prev_layers: [B, N, C, H, W] or None - ALL previous clean layers
-            low_res_context: [B, 1, H_low, W_low] or None - low resolution context image
+            low_res_context: [B, C, H_lr, W_lr] or None - low-res context input (currently unused)
+            low_res_features: [B, granularity, 128] or None - precomputed low-res features for all layers
         
         Returns:
             predicted_noise: [B, C, H, W]
@@ -1342,13 +1396,7 @@ class LayerXLayerDiffusionModelV2(nn.Module):
         h = self.input_conv(x)
 
 
-        if self.use_low_res_context and low_res_context is not None:
-            # Encode low-res context into per-layer features
-            low_res_features = self.low_res_encoder(
-                low_res_context, 
-                self.granularity
-            )  # [B, granularity, 128]
-            
+        if low_res_features is not None: 
             if self.current_low_res_layer_context: 
                 # Get features for current layer
                 batch_size = x.shape[0]
@@ -1374,8 +1422,8 @@ class LayerXLayerDiffusionModelV2(nn.Module):
             N = prev_layers.shape[1]
             
             # Encode previous layers
-            prev_layers_flat = prev_layers.view(B * N, prev_layers.shape[2], 
-                                               prev_layers.shape[3], prev_layers.shape[4])
+            prev_layers_flat = prev_layers.reshape(B * N, prev_layers.shape[2], 
+                                      prev_layers.shape[3], prev_layers.shape[4])
             prev_features = self.prev_layer_encoder(prev_layers_flat)
             prev_features = prev_features.view(B, N, prev_features.shape[1], 
                                               prev_features.shape[2], prev_features.shape[3])
@@ -1434,6 +1482,7 @@ class VoxelDataset(Dataset):
             "A voxel-based 3D object.",
             "A 3D shape made of voxels.",
         ]
+        
         self.enable_fuzzy_matching = enable_fuzzy_matching
         
         # Track description misses for debugging
@@ -1512,7 +1561,7 @@ class VoxelDataset(Dataset):
                 else:
                     print(f"No close match found for missing description: {filename_stem}")
             else:
-                print(f"Description file not found: {desc_file}")
+                # print(f"Description file not found: {desc_file}")
 
                 # Simple miss tracking without fuzzy matching
                 self.description_misses.append({
@@ -1542,7 +1591,7 @@ class VoxelDataset(Dataset):
         filename_key = self.file_list[idx].stem
         description = self._load_description(filename_key)
         
-        return voxel_grid, description
+        return voxel_grid, description, filename_key
     
     def save_miss_report(self, output_path="description_misses.txt"):
         """Save a report of all description misses"""
@@ -1590,7 +1639,8 @@ class LayerXLayerDiffusionTrainerV3:
         """
         self.model = model
         self.diffusion = diffusion
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+        lr = args.learning_rate if args.learning_rate is not None else 1e-5
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         self.scheduler = scheduler
         self.layer_by_layer_convergence = layer_by_layer_convergence
         self.teacher_forcing = teacher_forcing
@@ -1599,79 +1649,94 @@ class LayerXLayerDiffusionTrainerV3:
         self.ddim_eta = ddim_eta
         self.low_res_contexts = low_res_contexts or {}
 
-    def compute_loss(self, x0, context, low_res_context=None, backward=True):
-        """
-        Compute loss with optional backward pass.
-        
-        Args:
-            x0: [B, C, H, W, D] - full 3D object
-            context: [B, seq_len, context_dim] - text embeddings
-            low_res_context: Optional [B, C, H, W, D] - upsampled low-res conditioning
-            backward: Whether to perform backward pass and optimization
-        
-        Returns:
-            avg_loss: Average loss across all layers
-        """
+    def compute_loss(self, x0, context, low_res_context=None, backward=True, chunk_divide=2):
         if backward:
             self.model.train()
             self.optimizer.zero_grad()
         else:
             self.model.eval()
-
+        
         batch_size = x0.size(0)
         device = x0.device
         total_loss = 0
-        dtype = next(self.model.parameters()).dtype
-
-        # Accumulate all previous layers
+        model_dtype = next(self.model.parameters()).dtype
         prev_layers_list = []
+        max_context = self.model.max_context_layers
+        
+        low_res_features = None
+        if low_res_context is not None and self.model.use_low_res_context:
+            with torch.no_grad():  # Ensure no gradients
+                low_res_features = self.model.low_res_encoder(
+                    low_res_context.to(model_dtype),
+                    self.model.granularity
+                ).detach()
 
-        for layer_idx in range(self.model.granularity):
-            # Extract current layer
-            current_layer = x0[:, :, :, :, layer_idx]  # [B, C, H, W]
+        if chunk_divide is None:
+            chunk_size = self.model.granularity
+            start_layer = 0
+        else:
+            chunk_size = self.model.granularity // chunk_divide
+            start_layer = random.randint(0, self.model.granularity - chunk_size)
 
-            # Sample timestep
+        for layer_idx in range(start_layer, start_layer + chunk_size):           
+            current_layer = x0[:, :, :, :, layer_idx]
             t = torch.randint(0, self.diffusion.timesteps, (batch_size,), device=device).long()
-
-            # Add noise
             xt, noise = self.diffusion.forward(current_layer, t)
+            l = torch.full((batch_size,), layer_idx, device=device, dtype=model_dtype)
             
-            # Layer index tensor
-            l = torch.full((batch_size,), layer_idx, device=device, dtype=dtype)
-
-            # Stack all previous layers
-            if len(prev_layers_list) > 0:
-                prev_layers = torch.stack(prev_layers_list, dim=1)  # [B, N, C, H, W]
+        # Build prev_layers only from the chunk
+            if layer_idx > start_layer:
+                prev_layers = torch.stack(prev_layers_list, dim=1)
             else:
                 prev_layers = None
-
-            # Predict noise with cross-attention to ALL previous layers
-            predicted_noise = self.model(xt, t, l, context, prev_layers, low_res_context)
-
-            # Compute loss
+                
+            # SLIDING WINDOW
+            if len(prev_layers_list) > 0:
+                if max_context is not None and len(prev_layers_list) > max_context:
+                    prev_layers_list = prev_layers_list[-max_context:]
+                prev_layers = torch.stack(prev_layers_list, dim=1)
+            else:
+                prev_layers = None
+            
+            # ← PASS pre-computed features instead of raw low_res_context
+            predicted_noise = self.model(xt, t, l, context, prev_layers, 
+                                        low_res_features=low_res_features)  # Changed parameter name
             loss = F.mse_loss(predicted_noise.float(), noise.float())
-            total_loss += loss.detach() if backward else loss
 
+            if torch.isnan(loss):
+                print(f"NaN detected at layer {layer_idx}")
+                print(f"  predicted_noise contains NaN: {torch.isnan(predicted_noise).any()}")
+                print(f"  noise contains NaN: {torch.isnan(noise).any()}")
+                print(f"  xt contains NaN: {torch.isnan(xt).any()}")
+                print(f"  context contains NaN: {torch.isnan(context).any()}")
+                print(f"  predicted_noise stats: min={predicted_noise.min()}, max={predicted_noise.max()}")
+                raise ValueError("NaN loss detected!")
+            
             if backward:
                 loss.backward()
-
-            # Add current layer to history
+                total_loss += loss.item()
+                # Clear computation graph immediately
+                del loss, predicted_noise, xt, noise
+            else:
+                total_loss += loss.item()
+            
+            # Add to history (detached)
             if self.teacher_forcing:
                 prev_layers_list.append(current_layer.detach())
             else:
-                # Use denoised prediction
                 alpha_hat_t = self.diffusion.alpha_hats[t].view(-1, 1, 1, 1)
-                denoised = (xt - torch.sqrt(1 - alpha_hat_t) * predicted_noise) / torch.sqrt(alpha_hat_t)
+                eps = 1e-8
+                denoised = (xt - torch.sqrt(1 - alpha_hat_t + eps) * predicted_noise) / torch.sqrt(alpha_hat_t + eps)
                 prev_layers_list.append(denoised.detach())
-
-        # Optimize if backward pass requested
+        
         if backward:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.6)
             self.optimizer.step()
             if self.scheduler is not None:
                 self.scheduler.step()
-
-        avg_loss = total_loss / self.model.granularity
-        return avg_loss.item() if not backward else avg_loss
+        
+        avg_loss = total_loss / chunk_size
+        return avg_loss
 
     def train_step(self, x0, context, low_res_context=None):
         """
@@ -1864,6 +1929,38 @@ class LayerXLayerDiffusionTrainerV3:
             
             return voxel_grid.clamp(0, 1)
 
+class ResidualBlock3D(nn.Module):
+    """Residual block for 3D convolutions with proper skip connections"""
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        
+        # Main convolutional path
+        self.block = nn.Sequential(
+            nn.Conv3d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1),
+            nn.GroupNorm(min(8, out_ch), out_ch),
+            nn.SiLU(),
+            nn.Conv3d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(min(8, out_ch), out_ch),
+        )
+        
+        # Shortcut/skip connection
+        # Project if channels change OR spatial dimensions change (stride != 1)
+        if stride != 1 or in_ch != out_ch:
+            self.shortcut = nn.Conv3d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False)
+        else:
+            self.shortcut = nn.Identity()
+        
+        # Final activation (applied after adding residual)
+        self.activation = nn.SiLU()
+    
+    def forward(self, x):
+        identity = self.shortcut(x)
+        out = self.block(x)
+        out = out + identity
+        out = self.activation(out)
+        return out
+
+
 class LowResContextEncoder(nn.Module):
     """
     Enhanced encoder with better spatial and inter-layer awareness.
@@ -1875,13 +1972,16 @@ class LowResContextEncoder(nn.Module):
         
         # Deeper 3D encoder with residual connections
         self.encoder = nn.ModuleList([
-            self._make_conv3d_block(in_channels, base_channels),
-            self._make_conv3d_block(base_channels, base_channels * 2, stride=2),
-            self._make_conv3d_block(base_channels * 2, base_channels * 4, stride=2),
+            ResidualBlock3D(in_channels, base_channels, stride=1),
+            ResidualBlock3D(base_channels, base_channels * 2, stride=2),
+            ResidualBlock3D(base_channels * 2, base_channels * 4, stride=2),
         ])
         
         # Learnable layer positional embeddings
         self.layer_pos_embedding = nn.Embedding(256, 64)  # Support up to 256 layers
+        
+        # Projection layer for combining features with positional embeddings
+        self.pos_projection = nn.Linear(128 + 64, 128)
         
         if mode == 'spatial_aware':
             # Preserve spatial information via learned aggregation
@@ -1927,24 +2027,7 @@ class LowResContextEncoder(nn.Module):
             num_layers=2
         )
     
-    def _make_conv3d_block(self, in_ch, out_ch, stride=1):
-        """Create a residual 3D conv block"""
-        block = nn.Sequential(
-            nn.Conv3d(in_ch, out_ch, 3, stride=stride, padding=1),
-            nn.GroupNorm(min(8, out_ch), out_ch),
-            nn.SiLU(),
-            nn.Conv3d(out_ch, out_ch, 3, padding=1),
-            nn.GroupNorm(min(8, out_ch), out_ch),
-        )
-        
-        # Residual connection
-        if stride != 1 or in_ch != out_ch:
-            self.shortcut = nn.Conv3d(in_ch, out_ch, 1, stride=stride)
-        else:
-            self.shortcut = nn.Identity()
-        
-        return block
-    
+    @torch._dynamo.disable()
     def forward(self, low_res_voxels, target_granularity):
         """
         Args:
@@ -1959,12 +2042,8 @@ class LowResContextEncoder(nn.Module):
         features_pyramid = []
         x = low_res_voxels
         
-        for i, block in enumerate(self.encoder):
-            if i > 0:  # Apply shortcut for residual
-                identity = self.encoder[i-1].shortcut(x) if hasattr(self.encoder[i-1], 'shortcut') else x
-                x = block(x) + identity
-            else:
-                x = block(x)
+        for block in self.encoder:
+            x = block(x)
             features_pyramid.append(x)
         
         features = features_pyramid[-1]  # [B, C', H', W', D']
@@ -1988,7 +2067,7 @@ class LowResContextEncoder(nn.Module):
                 layer_feat = self.spatial_aggregator(layer_feat)  # [B, 128, H', W']
                 
                 # Flatten spatial dimensions for attention
-                B, C, H, W = layer_feat.shape
+                B_inner, C, H, W = layer_feat.shape
                 layer_feat_flat = layer_feat.flatten(2).transpose(1, 2)  # [B, H*W, 128]
                 
                 # Self-attention over spatial positions
@@ -2031,8 +2110,8 @@ class LowResContextEncoder(nn.Module):
         pos_emb = self.layer_pos_embedding(layer_indices).unsqueeze(0)  # [1, target_granularity, 64]
         
         # Concatenate and project back
-        layer_features = torch.cat([layer_features, pos_emb.expand(B, -1, -1)], dim=-1)
-        layer_features = nn.Linear(128 + 64, 128).to(layer_features.device)(layer_features)
+        layer_features = torch.cat([layer_features, pos_emb.expand(B, -1, -1)], dim=-1)  # [B, target_granularity, 192]
+        layer_features = self.pos_projection(layer_features)  # [B, target_granularity, 128]
         
         # Apply inter-layer transformer for vertical coherence
         layer_features = self.inter_layer_transformer(layer_features)  # [B, target_granularity, 128]
@@ -2052,6 +2131,9 @@ class FSDPProgressiveGranularityTrainer:
             save_dir='./training_visualizations'
         )
 
+        self.plots_dir = Path('./training_plots')
+        self.plots_dir.mkdir(parents=True, exist_ok=True)
+
 
         self.metrics_history = {
             'stages': {},  # Per-stage metrics
@@ -2059,6 +2141,118 @@ class FSDPProgressiveGranularityTrainer:
             'global_val_loss': [],  # All validation losses
             'global_epochs': [],  # Epoch numbers for global tracking
         }
+
+    def plot_loss_curves(self, stage_idx, stage_metrics, global_epoch_offset, current_epoch):
+        """
+        Plot and save loss curves for current stage and global progress.
+        
+        Args:
+            stage_idx: Current stage index
+            stage_metrics: Metrics dictionary for current stage
+            global_epoch_offset: Offset for global epoch numbering
+            current_epoch: Current epoch within this stage
+        """
+        if rank != 0:  # Only rank 0 creates plots
+            return
+        
+        try:
+            fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+            fig.suptitle(f'Training Progress - Stage {stage_idx + 1} (Epoch {current_epoch})', 
+                        fontsize=14, fontweight='bold')
+            
+            # 1. Current stage training loss
+            ax1 = axes[0, 0]
+            if stage_metrics['train_loss']:
+                epochs = list(range(1, len(stage_metrics['train_loss']) + 1))
+                ax1.plot(epochs, stage_metrics['train_loss'], 'b-', linewidth=2, alpha=0.7)
+                ax1.set_xlabel('Epoch')
+                ax1.set_ylabel('Training Loss')
+                ax1.set_title(f'Stage {stage_idx + 1} Training Loss ({stage_metrics["granularity"]}³)')
+                ax1.grid(True, alpha=0.3)
+            
+            # 2. Current stage validation loss
+            ax2 = axes[0, 1]
+            if stage_metrics['val_loss']:
+                val_epochs = list(range(args.validation_interval, 
+                                    len(stage_metrics['train_loss']) + 1, 
+                                    args.validation_interval))[:len(stage_metrics['val_loss'])]
+                ax2.plot(val_epochs, stage_metrics['val_loss'], 'r-o', linewidth=2, alpha=0.7)
+                ax2.set_xlabel('Epoch')
+                ax2.set_ylabel('Validation Loss')
+                ax2.set_title(f'Stage {stage_idx + 1} Validation Loss ({stage_metrics["granularity"]}³)')
+                ax2.grid(True, alpha=0.3)
+                
+                # Mark best validation loss
+                if stage_metrics['val_loss']:
+                    best_val = min(stage_metrics['val_loss'])
+                    best_idx = stage_metrics['val_loss'].index(best_val)
+                    best_epoch = val_epochs[best_idx]
+                    ax2.scatter([best_epoch], [best_val], c='gold', s=200, marker='*', 
+                            zorder=5, edgecolors='black', linewidths=1.5, 
+                            label=f'Best: {best_val:.4f}')
+                    ax2.legend()
+            
+            # 3. Global training loss (all stages so far)
+            ax3 = axes[1, 0]
+            if self.metrics_history['global_train_loss']:
+                global_epochs = list(range(1, len(self.metrics_history['global_train_loss']) + 1))
+                ax3.plot(global_epochs, self.metrics_history['global_train_loss'], 
+                        'g-', linewidth=2, alpha=0.7)
+                
+                # Add vertical lines for stage boundaries
+                for i in range(stage_idx):
+                    boundary = sum([len(self.metrics_history['stages'][j]['train_loss']) 
+                                for j in range(i + 1)])
+                    ax3.axvline(boundary, color='red', linestyle='--', alpha=0.5, linewidth=1.5)
+                
+                ax3.set_xlabel('Global Epoch')
+                ax3.set_ylabel('Training Loss')
+                ax3.set_title('Global Training Loss (All Stages)')
+                ax3.grid(True, alpha=0.3)
+            
+            # 4. Training summary
+            ax4 = axes[1, 1]
+            ax4.axis('off')
+            
+            summary_text = "Current Training Status\n" + "="*40 + "\n\n"
+            summary_text += f"Stage: {stage_idx + 1}/{len(self.granularities)}\n"
+            summary_text += f"Granularity: {stage_metrics['granularity']}³\n"
+            summary_text += f"Epoch: {current_epoch}\n\n"
+            
+            if stage_metrics['train_loss']:
+                summary_text += f"Current Train Loss: {stage_metrics['train_loss'][-1]:.4f}\n"
+            
+            if stage_metrics['val_loss']:
+                summary_text += f"Latest Val Loss: {stage_metrics['val_loss'][-1]:.4f}\n"
+                summary_text += f"Best Val Loss: {min(stage_metrics['val_loss']):.4f}\n"
+            
+            if stage_metrics['val_occupancy']:
+                summary_text += f"Val Occupancy: {stage_metrics['val_occupancy'][-1]:.2%}\n"
+            
+            if stage_metrics['val_density']:
+                summary_text += f"Val Density: {stage_metrics['val_density'][-1]:.4f}\n"
+            
+            # Add info about completed stages
+            if stage_idx > 0:
+                summary_text += "\nCompleted Stages:\n"
+                for i in range(stage_idx):
+                    gran = self.metrics_history['stages'][i]['granularity']
+                    best_val = self.metrics_history['stages'][i]['best_val_loss']
+                    summary_text += f"  {gran}³: {best_val:.4f}\n"
+            
+            ax4.text(0.05, 0.95, summary_text, transform=ax4.transAxes,
+                    fontsize=11, verticalalignment='top', fontfamily='monospace',
+                    bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.3))
+            
+            plt.tight_layout()
+            
+            # Save with both stage and global epoch numbers
+            save_path = self.plots_dir / f'stage{stage_idx}_epoch{current_epoch}_global{global_epoch_offset + current_epoch}.png'
+            plt.savefig(save_path, dpi=100, bbox_inches='tight')
+            plt.close()
+            
+        except Exception as e:
+            print_main(f"⚠ Error plotting loss curves: {e}")
         
     def train_all_stages(self, epochs_per_stage, device, embedding_cache):
         """Train all granularity stages sequentially and return metrics"""
@@ -2079,7 +2273,7 @@ class FSDPProgressiveGranularityTrainer:
                 npy_folder_path=f'/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_voxels/{granularity}',
                 description_folder_path='/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_descriptions',
                 granularity=granularity,
-                test_count=100,  # Adjust as needed
+                test_count=0,  # Adjust as needed
                 enable_fuzzy_matching=args.enable_fuzzy_matching
             )
             
@@ -2087,7 +2281,7 @@ class FSDPProgressiveGranularityTrainer:
                 npy_folder_path=f'/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_voxels/{granularity}',
                 description_folder_path='/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_descriptions',
                 granularity=granularity,
-                test_count=100,
+                test_count=400,  # Use 400 samples for validation
                 enable_fuzzy_matching=args.enable_fuzzy_matching
             )
             
@@ -2177,45 +2371,55 @@ class FSDPProgressiveGranularityTrainer:
                 path_list = [None]
             dist.broadcast_object_list(path_list, src=0)
             self.stage_checkpoints[stage_idx] = path_list[0]
-    
-    def load_prev_stage_model_cpu(self, stage_idx):
-        """Load previous stage model on CPU for inference"""
+
+    def load_prev_stage_model_gpu(self, stage_idx, device):
+        """Load previous stage model on GPU for training"""
         if stage_idx == 0 or stage_idx - 1 not in self.stage_checkpoints:
             return None
         
         checkpoint_path = self.stage_checkpoints[stage_idx - 1]
         prev_granularity = self.granularities[stage_idx - 1]
         
-        # Load model on CPU (only rank 0 needs to do this)
-        if rank == 0:
-            # Create model WITHOUT FSDP wrapping
-            prev_model = LayerXLayerDiffusionModelV2(  # Use base model for stage 0
-                layer_context_dim=64,
-                granularity=prev_granularity,
-                text_context_dim=768,
-                max_context_layers=16,
-                in_channels=1,
-                model_channels=512,
-                context_dim=768,
-                attention_resolutions=[8, 16, 32]
-            )
-            
-            # Load checkpoint
-            checkpoint = torch.load(checkpoint_path, map_location='cpu')
-            prev_model.load_state_dict(checkpoint['model_state_dict'])
-            prev_model.eval()
-            prev_model = prev_model.cpu()  # Keep on CPU
-            
-            print(f"✓ Loaded stage {stage_idx-1} model on CPU for inference")
-            return prev_model
-        else:
-            return None  # Only rank 0 has the model
+        use_low_res_prev = stage_idx - 1 > 0  # Stage 1+ uses low-res context
 
+        # Load model on GPU
+        # Create model WITHOUT FSDP wrapping
+        prev_model = LayerXLayerDiffusionModelV2(
+            layer_context_dim=64,
+            granularity=prev_granularity,
+            text_context_dim=768,
+            max_context_layers=16,
+            in_channels=1,
+            model_channels=512,
+            context_dim=768,
+            attention_resolutions=[8, 16, 32],
+            use_low_res_context=use_low_res_prev,
+            current_low_res_layer_context=args.current_layer_only  # ← Add this
+        ).to(device)
+        
+        # Load checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        
+        # Strip _orig_mod. prefix if present (from torch.compile)
+        state_dict = checkpoint['model_state_dict']
+        if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+        
+        prev_model.load_state_dict(state_dict)
+        prev_model.eval()
+        
+        print(f"✓ Loaded stage {stage_idx-1} model on GPU for stage {stage_idx} training:")
+        print(f"  - use_low_res_context: {use_low_res_prev}")
+        print(f"  - Model has low_res_encoder: {hasattr(prev_model, 'low_res_encoder')}")
+
+        return prev_model
+        
     def precompute_low_res_contexts(self, stage_idx, train_dataset, device, 
-                                     embedding_cache, batch_size=4):
+                                embedding_cache, batch_size=4):
         """
         Precompute all low-res contexts before training starts.
-        Only rank 0 generates, then broadcasts to all ranks.
+        Handles recursive context loading (stage 2 needs stage 1 contexts, 
+        which were generated with stage 0 contexts).
         """
         if stage_idx == 0:
             return {}
@@ -2230,44 +2434,100 @@ class FSDPProgressiveGranularityTrainer:
             print_main(f"✓ Loaded {len(low_res_contexts)} cached contexts")
             return low_res_contexts
         
-        # Load previous stage model on CPU (rank 0 only)
-        prev_model = self.load_prev_stage_model_cpu(stage_idx)
+        # Load previous stage model on GPU
+        prev_model = self.load_prev_stage_model_gpu(stage_idx, device)
+        
+        # RECURSIVE: Load contexts for the PREVIOUS stage
+        prev_low_res_contexts = {}
+        if stage_idx > 1:
+            prev_context_path = f'low_res_context_stage{stage_idx - 1}.pth'
+            if Path(prev_context_path).exists():
+                print_main(f"  Loading recursive contexts from {prev_context_path}...")
+                prev_low_res_contexts = torch.load(prev_context_path, map_location='cpu')
+                print_main(f"  ✓ Loaded {len(prev_low_res_contexts)} recursive contexts")
         
         low_res_contexts = {}
         curr_granularity = self.granularities[stage_idx]
         prev_granularity = self.granularities[stage_idx - 1]
         
         if rank == 0:
+            # ✅ FIX: Build file stem mapping between current and previous datasets
+            curr_stems = set()
+            for file_path in train_dataset.file_list:
+                curr_stems.add(file_path.stem)
+            
             # Create dataset for previous granularity
+            # ✅ Use ALL available files, not test_count
             prev_dataset = VoxelDataset(
                 npy_folder_path=f'/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_voxels/{prev_granularity}',
                 description_folder_path='/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_descriptions',
                 granularity=prev_granularity,
-                test_count=100,
+                test_count=0,  # ✅ Load ALL files, not just 100
                 enable_fuzzy_matching=args.enable_fuzzy_matching
             )
+            
+            # ✅ Filter to only files that exist in current dataset
+            prev_file_list = [f for f in prev_dataset.file_list if f.stem in curr_stems]
+            
+            print_main(f"  Current dataset has {len(curr_stems)} unique samples")
+            print_main(f"  Previous dataset has {len(prev_file_list)} matching samples")
+            print_main(f"  Will generate contexts for {len(prev_file_list)} samples")
+            
+            if len(prev_file_list) < len(curr_stems):
+                missing = curr_stems - set(f.stem for f in prev_file_list)
+                print_main(f"  ⚠ Warning: {len(missing)} samples from current dataset not found in previous granularity")
+                print_main(f"     First few missing: {list(missing)[:5]}")
+            
+            # ✅ Create filtered dataset
+            prev_dataset.file_list = prev_file_list
             
             prev_loader = DataLoader(
                 prev_dataset, 
                 batch_size=batch_size, 
                 shuffle=False,
                 num_workers=2,
+                prefetch_factor=4,
                 persistent_workers=True
             )
             
             # Generate low-res voxels using previous stage model
             with torch.no_grad():
-                for batch_idx, (x0, descriptions) in enumerate(tqdm(
+                for batch_idx, batch_data in enumerate(tqdm(
                     prev_loader, desc="Generating low-res contexts"
                 )):
-                    # Get embeddings
+                    x0, descriptions, file_stems = batch_data
+                    
                     context = embedding_cache.get_batch_embeddings(
-                        descriptions, 'cpu'
+                        descriptions, device
                     )
                     
-                    # Generate using previous model (on CPU)
-                    samples = self._fast_sample_cpu(
-                        prev_model, context, x0.shape, prev_granularity
+                    # Get recursive contexts for this batch (if stage 2+)
+                    batch_prev_contexts = None
+                    if prev_low_res_contexts:
+                        batch_prev_contexts = []
+                        for stem in file_stems:
+                            if stem in prev_low_res_contexts:
+                                batch_prev_contexts.append(
+                                    prev_low_res_contexts[stem].to(device, dtype=MASTER_DTYPE)
+                                )
+                            else:
+                                print_main(f"  ⚠ Missing recursive context for {stem}")
+                                batch_prev_contexts.append(
+                                    torch.zeros(1, prev_granularity, prev_granularity, prev_granularity,
+                                            device=device, dtype=MASTER_DTYPE)
+                                )
+                        
+                        if batch_prev_contexts:
+                            batch_prev_contexts = torch.stack(batch_prev_contexts)
+                    
+                    # Check if batch_prev_contexts is ready
+                    if prev_low_res_contexts and batch_prev_contexts is None:
+                        raise ValueError("Expected batch_prev_contexts to be populated but it's None")
+
+                    # Generate samples with recursive contexts
+                    samples = self._sample_gpu(
+                        prev_model, context, x0.shape, prev_granularity, device,
+                        low_res_contexts=batch_prev_contexts
                     )
                     
                     # Upsample to current granularity
@@ -2278,81 +2538,89 @@ class FSDPProgressiveGranularityTrainer:
                         align_corners=False
                     )
                     
-                    # Store with dataset indices
-                    for i, desc in enumerate(descriptions):
-                        idx = batch_idx * batch_size + i
-                        low_res_contexts[idx] = upsampled[i].cpu()
+                    # Store with file stem as key
+                    for i, stem in enumerate(file_stems):
+                        low_res_contexts[stem] = upsampled[i].cpu()
                     
                     # Save periodically
                     if (batch_idx + 1) % 10 == 0:
                         self._save_context_cache(low_res_contexts, stage_idx)
+                        print_main(f"  Saved {len(low_res_contexts)} contexts (checkpoint)")
             
-            print(f"✓ Generated {len(low_res_contexts)} low-res contexts")
+            print_main(f"✓ Generated {len(low_res_contexts)} low-res contexts")
             
             # Final save
             self._save_context_cache(low_res_contexts, stage_idx)
+            
+            # Clear memory
+            del prev_model
+            del prev_low_res_contexts
+            torch.cuda.empty_cache()
         
         # Synchronize all ranks
         if is_distributed:
             dist.barrier()
-            # All ranks load from disk
             low_res_contexts = self._load_context_cache(stage_idx)
         
         return low_res_contexts
     
-    def _fast_sample_cpu(self, model, context, shape, granularity):
-        """Fast DDIM sampling on CPU for context generation"""
+    def _sample_gpu(self, model, context, shape, granularity, device, low_res_contexts=None):
+        """
+        Standard sampling on GPU for context generation.
+        
+        Args:
+            model: The diffusion model
+            context: Text embeddings [B, seq_len, 768]
+            shape: Tuple of (batch_size, channels, height, width)
+            granularity: Resolution of voxel grid
+            device: Device to run on
+            low_res_contexts: Optional [B, 1, H, W, D] low-res conditioning from previous stage
+        """
         model.eval()
         batch_size = shape[0]
-        
-        # Use DDIM with fewer steps for speed
-        ddim_steps = 20
-        timestep_interval = 1000 // ddim_steps
-        ddim_timesteps = list(range(0, 1000, timestep_interval))
-        ddim_timesteps.reverse()
-        
         voxel_grid = torch.zeros(
             (batch_size, 1, granularity, granularity, granularity),
-            device='cpu'
+            device=device,
+            dtype=MASTER_DTYPE
         )
         
         generated_layers = []
-        diffusion = ForwardDiffusion(timesteps=1000, schedule='cosine')
+        diffusion = ForwardDiffusion(timesteps=100, schedule='cosine')
         
         for layer_idx in range(granularity):
-            l = torch.full((batch_size,), layer_idx, dtype=torch.float32)
-            x = torch.randn((batch_size, 1, granularity, granularity))
+            l = torch.full((batch_size,), layer_idx, dtype=MASTER_DTYPE, device=device)
+            x = torch.randn((batch_size, 1, granularity, granularity), device=device, dtype=MASTER_DTYPE)
             
             if len(generated_layers) > 0:
                 prev_layers = torch.stack(generated_layers, dim=1)
             else:
                 prev_layers = None
             
-            # DDIM sampling
-            for i, t in enumerate(ddim_timesteps):
-                t_batch = torch.full((batch_size,), t, dtype=torch.float32)
+            # Run diffusion to convergence
+            for t in reversed(range(diffusion.timesteps)):
+                t_batch = torch.full((batch_size,), t, dtype=MASTER_DTYPE, device=device)
                 
                 predicted_noise = model(
-                    x, t_batch, l, context, prev_layers
+                    x, t_batch, l, context, prev_layers,
+                    low_res_context=low_res_contexts  # ← Pass low-res contexts
                 )
                 
+                alpha_t = diffusion.alphas[t]
                 alpha_hat_t = diffusion.alpha_hats[t]
-                pred_x0 = (x - torch.sqrt(1 - alpha_hat_t) * predicted_noise) / torch.sqrt(alpha_hat_t)
-                pred_x0 = pred_x0.clamp(-1, 1)
+                beta_t = diffusion.betas[t]
                 
-                if i < len(ddim_timesteps) - 1:
-                    t_prev = ddim_timesteps[i + 1]
-                    alpha_hat_t_prev = diffusion.alpha_hats[t_prev]
-                    dir_xt = torch.sqrt(1 - alpha_hat_t_prev) * predicted_noise
-                    x = torch.sqrt(alpha_hat_t_prev) * pred_x0 + dir_xt
+                if t > 0:
+                    noise = torch.randn_like(x)
                 else:
-                    x = pred_x0
+                    noise = torch.zeros_like(x)
+                
+                x = (1 / torch.sqrt(alpha_t)) * (x - ((1 - alpha_t) / torch.sqrt(1 - alpha_hat_t)) * predicted_noise) + torch.sqrt(beta_t) * noise
             
             voxel_grid[:, :, :, :, layer_idx] = x
             generated_layers.append(x.detach())
         
         return voxel_grid.clamp(0, 1)
-    
+        
     def _save_context_cache(self, contexts, stage_idx):
         """Save context cache to disk"""
         cache_path = f'low_res_context_stage{stage_idx}.pth'
@@ -2366,8 +2634,7 @@ class FSDPProgressiveGranularityTrainer:
             return torch.load(cache_path, map_location='cpu')
         return {}
     
-    def train_stage(self, stage_idx, train_dataset, val_dataset,
-                   epochs, device, embedding_cache):
+    def train_stage(self, stage_idx, train_dataset, val_dataset, epochs, device, embedding_cache):
         """FSDP-compatible stage training"""
         granularity = self.granularities[stage_idx]
         use_low_res = stage_idx > 0
@@ -2394,8 +2661,9 @@ class FSDPProgressiveGranularityTrainer:
             'val_density': [],
             'epochs': list(range(1, epochs + 1))
         }
-        
-        # Create model (use base model for now, can extend later)
+
+        # Create model
+        print_main("Creating model...")
         model = LayerXLayerDiffusionModelV2(
             layer_context_dim=64,
             granularity=granularity,
@@ -2405,26 +2673,38 @@ class FSDPProgressiveGranularityTrainer:
             model_channels=512,
             context_dim=768,
             attention_resolutions=[8, 16, 32],
+            use_low_res_context=use_low_res, 
             current_low_res_layer_context=args.current_layer_only
         )
-        
-        model = initialize_model_weights(model).to(device)
+        model = initialize_model_weights(model)
 
-        model = torch.compile(model, mode='default')
-        
-        # Wrap with FSDP
+        if Path('encoder_checkpoints_16_to_32/encoder_best.pth').exists():
+            model = load_pretrained_encoder(
+                model, 
+                'encoder_checkpoints_16_to_32/encoder_best.pth'
+            )
+
+        # Convert to target dtype
+        model = model.to(dtype=MASTER_DTYPE).to(device)
+
+        # Then wrap with FSDP
         if args.shard_model:
             fsdp_config = get_fsdp_config()
             model = FSDP(model, **fsdp_config)
-            print_main("✓ Model wrapped with FSDP")
+
+        model = torch.compile(model, mode='max-autotune', fullgraph=True)
+
+        # model = torch.compile(model, mode='default')
+
+        print_main("✓ Model created and compiled")
         
         # Create trainer
-        diffusion = ForwardDiffusion(timesteps=1000, schedule='cosine')
-        trainer = LayerXLayerDiffusionTrainerV3(  # Use unified trainer
+        diffusion = ForwardDiffusion(timesteps=100, schedule='cosine')
+        trainer = LayerXLayerDiffusionTrainerV3(
             model=model,
             diffusion=diffusion,
             scheduler=None,
-            low_res_contexts=low_res_contexts,  # Pass precomputed contexts
+            low_res_contexts=low_res_contexts,
             use_ddim=True,
             ddim_steps=50
         )
@@ -2438,23 +2718,19 @@ class FSDPProgressiveGranularityTrainer:
         # Training loop
         best_val_loss = float('inf')
         
-        epoch_iterator = tqdm(
-        range(epochs), 
-        desc=f"Stage {stage_idx+1} Training", 
-        disable=(rank != 0),
-        unit="epoch"
-        )
-
-        if rank == 0:
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
-
-    
-        for epoch in epoch_iterator:
+        print_main(f"\nStarting training for {epochs} epochs...")
+        print_main("="*60)
+        
+        for epoch in range(epochs):
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
             
-            # Capture metrics
+            # Print epoch header
+            if rank == 0:
+                print(f"\n[Stage {stage_idx + 1}] Epoch {epoch + 1}/{epochs}")
+                print("-" * 60)
+            
+            # Training epoch
             epoch_metrics = self._train_epoch(
                 trainer, train_loader, embedding_cache, 
                 device, epoch, stage_idx
@@ -2463,7 +2739,12 @@ class FSDPProgressiveGranularityTrainer:
             epoch_loss = epoch_metrics['train_loss']
             stage_metrics['train_loss'].append(epoch_loss)
             
-            print_main(f"Epoch {epoch+1}/{epochs} - Loss: {epoch_loss:.4f}")
+            if rank == 0:
+                print(f"Training Loss: {epoch_loss:.4f}")
+            
+            # Calculate global epoch for plotting
+            global_epoch_offset = sum([len(self.metrics_history['stages'][i]['train_loss']) 
+                                    for i in range(stage_idx)]) if stage_idx > 0 else 0
             
             # Validation
             if (epoch + 1) % args.validation_interval == 0:
@@ -2476,55 +2757,68 @@ class FSDPProgressiveGranularityTrainer:
                 stage_metrics['val_occupancy'].append(val_metrics.get('val_occupancy', 0))
                 stage_metrics['val_density'].append(val_metrics.get('val_density', 0))
 
-                if rank == 0:  # Only rank 0 generates visualizations
+                if rank == 0:
+                    print(f"Validation Loss: {val_loss:.4f}")
+                    print(f"Occupancy: {val_metrics.get('val_occupancy', 0):.2%}")
+                    print(f"Density: {val_metrics.get('val_density', 0):.4f}")
+                    
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        print(f"✓ New best validation loss: {best_val_loss:.4f}")
+                    
+                    # Peak memory tracking
+                    if torch.cuda.is_available():
+                        peak_memory = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+                        print(f"Peak Memory: {peak_memory:.2f} GB")
+
+                # Generate visualizations (only rank 0)
+                if rank == 0:
                     print_main("\nGenerating validation visualizations...")
                     
-                    # Create sample descriptions
                     sample_descriptions = [
                         "A wooden chair with four legs",
                         "A simple ceramic mug",
                         "A spherical ball",
                         "A rectangular table"
-                    ][:4]  # Adjust number of samples
+                    ][:4]
+
+                    t5_tokenizer = T5Tokenizer.from_pretrained('t5-base')
+                    t5_model = T5EncoderModel.from_pretrained('t5-base').to(device)
                     
                     try:
                         self.visualizer.visualize_epoch_samples(
                             trainer=trainer,
-                            epoch=epoch + 1,  # 1-indexed for display
+                            epoch=epoch + 1,
                             descriptions=sample_descriptions,
                             embedding_cache=embedding_cache,
-                            context_encoder=None,  # Not needed if cache works
-                            tokenizer=None,
+                            context_encoder=t5_model,
+                            tokenizer=t5_tokenizer,
                             granularity=granularity,
                             device=device,
                             num_samples=len(sample_descriptions),
-                            view_angles=[(30, 45), (60, 120), (0, 0)],  # Multiple views
+                            view_angles=[(30, 45), (60, 120), (0, 0)],
                             show_slices=True,
-                            show_progress=True
+                            show_progress=False  # Disable progress in visualization
                         )
                         print_main("✓ Visualization saved successfully")
                     except Exception as e:
                         print_main(f"⚠ Visualization failed: {e}")
-
-                # Update progress bar postfix instead of print
-                if rank == 0:
-                    epoch_iterator.set_postfix({
-                        'loss': f'{epoch_loss:.4f}',
-                        'best_val': f'{best_val_loss:.4f}'
-                    })
-
-                    peak_memory = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-                    print(f"Peak Memory: {peak_memory:.2f} GB")
-            
+                    finally:
+                        del t5_model
+                        del t5_tokenizer
+                        torch.cuda.empty_cache()
+                
                 # Synchronize after visualization
                 if is_distributed:
                     dist.barrier()
-                
-                print_main(f"Validation Loss: {val_loss:.4f}")
-                
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    print_main(f"✓ New best: {best_val_loss:.4f}")
+            
+            # Plot loss curves every epoch (only rank 0)
+            if rank == 0:
+                self.plot_loss_curves(stage_idx, stage_metrics, global_epoch_offset, epoch + 1)
+            
+            if rank == 0:
+                print("="*60)
+        
         # Save stage metrics
         stage_metrics['best_val_loss'] = best_val_loss
         self.metrics_history['stages'][stage_idx] = stage_metrics
@@ -2541,35 +2835,36 @@ class FSDPProgressiveGranularityTrainer:
             dist.barrier()
         
         return stage_metrics
-    
-    def _train_epoch(self, trainer, dataloader, embedding_cache,
-                device, epoch, stage_idx):
+        
+    def _train_epoch(self, trainer, dataloader, embedding_cache, device, epoch, stage_idx):
         """Training epoch with cached low-res contexts"""
         trainer.model.train()
         epoch_loss = 0
         num_batches = 0
         
-
-        pbar = dataloader
-        
-        for batch_idx, (x0, descriptions) in enumerate(pbar):
-            if is_distributed:
-                dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            else:
-                dtype = torch.float16
-            x0 = x0.to(device, dtype=dtype)
+        for batch_idx, batch_data in enumerate(dataloader):
+            # Unpack with file stems
+            x0, descriptions, file_stems = batch_data
+            
+            x0 = x0.to(device, dtype=MASTER_DTYPE)
             context = embedding_cache.get_batch_embeddings(descriptions, device)
             
-            # Get precomputed low-res contexts
+            # Get precomputed low-res contexts using file stems
             low_res_batch = None
             if stage_idx > 0 and trainer.low_res_contexts:
-                batch_start = batch_idx * dataloader.batch_size
                 low_res_batch = []
-                for i in range(len(descriptions)):
-                    idx = batch_start + i
-                    if idx in trainer.low_res_contexts:
+                for stem in file_stems:
+                    if stem in trainer.low_res_contexts:
                         low_res_batch.append(
-                            trainer.low_res_contexts[idx].to(device, dtype=dtype)
+                            trainer.low_res_contexts[stem].to(device, dtype=MASTER_DTYPE).detach()
+                        )
+                    else:
+                        # This shouldn't happen if precomputation worked
+                        print_main(f"⚠ Warning: Missing low-res context for {stem}")
+                        # Fallback: use zeros
+                        low_res_batch.append(
+                            torch.zeros(1, x0.shape[2], x0.shape[3], x0.shape[4],
+                                    device=device, dtype=MASTER_DTYPE)
                         )
                 
                 if low_res_batch:
@@ -2580,8 +2875,10 @@ class FSDPProgressiveGranularityTrainer:
             epoch_loss += loss
             num_batches += 1
             
-            # if rank == 0:
-            #     pbar.set_postfix({'loss': f'{loss:.4f}'})
+            # Print progress every 50 batches (optional)
+            if rank == 0 and (batch_idx + 1) % 50 == 0:
+                avg_loss = epoch_loss / num_batches
+                print(f"  Batch {batch_idx + 1}/{len(dataloader)} - Avg Loss: {avg_loss:.4f}")
         
         # Synchronize metrics across ranks
         if is_distributed:
@@ -2594,7 +2891,7 @@ class FSDPProgressiveGranularityTrainer:
         return {
             'train_loss': avg_loss,
             'num_batches': num_batches
-        }  
+        }
     
     def _validate_epoch(self, trainer, dataloader, embedding_cache, device, stage_idx):
         """Validation epoch with comprehensive metrics"""
@@ -2605,27 +2902,24 @@ class FSDPProgressiveGranularityTrainer:
         num_batches = 0
         
         with torch.no_grad():
-            for batch_idx, (x0, descriptions) in enumerate(dataloader):
-                if num_batches >= 10:  # Limit validation batches
+            for batch_idx, batch_data in enumerate(dataloader):
+                if num_batches >= 10:
                     break
                 
-                if is_distributed:
-                    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-                else:
-                    dtype = torch.float16
-                x0 = x0.to(device, dtype=dtype)
+                # Unpack with file stems
+                x0, descriptions, file_stems = batch_data
+                
+                x0 = x0.to(device, dtype=MASTER_DTYPE)
                 context = embedding_cache.get_batch_embeddings(descriptions, device)
                 
-                # Get low-res contexts if available
+                # Get low-res contexts using file stems
                 low_res_batch = None
                 if stage_idx > 0 and trainer.low_res_contexts:
-                    batch_start = batch_idx * dataloader.batch_size
                     low_res_batch = []
-                    for i in range(len(descriptions)):
-                        idx = batch_start + i
-                        if idx in trainer.low_res_contexts:
+                    for stem in file_stems:
+                        if stem in trainer.low_res_contexts:
                             low_res_batch.append(
-                                trainer.low_res_contexts[idx].to(device, dtype=dtype)
+                                trainer.low_res_contexts[stem].to(device, dtype=MASTER_DTYPE).detach()
                             )
                     
                     if low_res_batch:
@@ -2659,7 +2953,7 @@ class FSDPProgressiveGranularityTrainer:
             'val_occupancy': total_occupancy / num_batches if num_batches > 0 else 0,
             'val_density': total_density / num_batches if num_batches > 0 else 0
         }
-
+    
 class TrainingVoxelVisualizer:
     def __init__(self, save_dir, max_voxels=30000):
         """
@@ -2709,7 +3003,7 @@ class TrainingVoxelVisualizer:
                             embedding_cache=None, context_encoder=None, 
                             tokenizer=None, granularity=32, device='cuda', 
                             num_samples=4, view_angles=[(30, 45), (60, 120)],
-                            colormap='viridis', show_slices=True, show_progress=True):
+                            colormap='viridis', show_slices=True, show_progress=False):
         """
         Generate and visualize samples at a given epoch.
         
@@ -2738,7 +3032,8 @@ class TrainingVoxelVisualizer:
                 "A simple cube",
                 "A sphere",
                 "A pyramid",
-                "An abstract shape"
+                "An abstract shape",
+                "A House"
             ][:num_samples]
         
         # Encode descriptions to context embeddings
@@ -3101,15 +3396,24 @@ def create_distributed_dataloaders(train_dataset, val_dataset, batch_size):
         shuffle_train = True
     
     # Create DataLoaders
+    def collate_fn(batch):
+        """Custom collate to handle 3-tuple"""
+        voxels = torch.stack([item[0] for item in batch])
+        descriptions = [item[1] for item in batch]
+        file_stems = [item[2] for item in batch]  # Keep as list
+        return voxels, descriptions, file_stems
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         sampler=train_sampler,
         shuffle=shuffle_train if train_sampler is None else False,
-        num_workers=4 * (world_size if is_distributed else 1),  # Scale workers with GPUs
+        num_workers=4 * (world_size if is_distributed else 1),
         pin_memory=True,
-        drop_last=True,  # Important for distributed training
-        persistent_workers=True
+        prefetch_factor=4,
+        drop_last=True,
+        persistent_workers=True,
+        collate_fn=collate_fn  # ← Add custom collate
     )
     
     val_loader = DataLoader(
@@ -3120,7 +3424,9 @@ def create_distributed_dataloaders(train_dataset, val_dataset, batch_size):
         num_workers=4 * (world_size if is_distributed else 1),
         pin_memory=True,
         drop_last=False,
-        persistent_workers=True
+        prefetch_factor=4,
+        persistent_workers=True,
+        collate_fn=collate_fn  # ← Add custom collate
     )
     
     return train_loader, val_loader, train_sampler
@@ -3134,7 +3440,7 @@ train_dataset_3d = VoxelDataset(
     npy_folder_path=f'/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_voxels/{granularity}', 
     description_folder_path='/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_descriptions', 
     granularity=granularity, 
-    test_count=100,  # Use full training set
+    test_count=0,  # Use full training set
     enable_fuzzy_matching=args.enable_fuzzy_matching
 )
 
@@ -3142,12 +3448,12 @@ val_dataset_3d = VoxelDataset(
     npy_folder_path=f'/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_voxels/{granularity}', 
     description_folder_path='/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_descriptions', 
     granularity=granularity, 
-    test_count=100,  # Use 100 samples for validation
+    test_count=400,  # Use 400 samples for validation
     enable_fuzzy_matching=args.enable_fuzzy_matching
 )
 
 
-batch_size = args.batch_size if args.batch_size is not None else 4  # Your default batch size
+batch_size = args.batch_size
 
 dataloader_3d_train, dataloader_3d_val, train_sampler = create_distributed_dataloaders(
     train_dataset_3d,
@@ -3180,23 +3486,28 @@ embedding_cache.load_cache()  # Load existing cache if available
 
 # Precompute embeddings for all descriptions in both train and val datasets
 # Pass the datasets directly - they will be scanned for uncached descriptions
-print_main("Precomputing embeddings for training dataset...")
-embedding_cache.precompute_embeddings(
-    texts=train_dataset_3d,  # Pass dataset directly
-    tokenizer=t5_tokenizer,
-    model=t5_model,
-    device=device,
-    batch_size=256
-)
+# Precompute embeddings for all descriptions in both train and val datasets
+# Pass the datasets directly - they will be scanned for uncached descriptions
+if not args.skip_cache_scan:
+    print_main("Precomputing embeddings for training dataset...")
+    embedding_cache.precompute_embeddings(
+        texts=train_dataset_3d,  # Pass dataset directly
+        tokenizer=t5_tokenizer,
+        model=t5_model,
+        device=device,
+        batch_size=256
+    )
 
-print_main("Precomputing embeddings for validation dataset...")
-embedding_cache.precompute_embeddings(
-    texts=val_dataset_3d,  # Pass dataset directly
-    tokenizer=t5_tokenizer,
-    model=t5_model,
-    device=device,
-    batch_size=256
-)
+    print_main("Precomputing embeddings for validation dataset...")
+    embedding_cache.precompute_embeddings(
+        texts=val_dataset_3d,  # Pass dataset directly
+        tokenizer=t5_tokenizer,
+        model=t5_model,
+        device=device,
+        batch_size=256
+    )
+else:
+    print_main("Skipping cache scan (--skip_cache_scan flag set)")
 
 train_dataset_3d.save_miss_report(output_path='train_description_miss_report.txt')
 val_dataset_3d.save_miss_report(output_path='val_description_miss_report.txt')
@@ -3204,6 +3515,8 @@ print("Saved miss reports for datasets.")
 
 # Optional: Free T5 model from GPU to save memory (embeddings are now cached)
 t5_model = t5_model.cpu()
+
+embedding_cache.set_embedding_model(t5_model, t5_tokenizer)
 print_main("✓ T5 embeddings cached! Training will use cached embeddings for speed.\n")
 
 # %%
@@ -3223,9 +3536,9 @@ progressive_trainer = FSDPProgressiveGranularityTrainer(
     granularities=[16, 32, 64]
 )
 
-# Train all stages
+# Train all stages with specified epochs per stage
 results = progressive_trainer.train_all_stages(
-    epochs_per_stage=[20, 15, 15],  # Epochs for 16³, 32³, 64³
+    epochs_per_stage=[500, 250, 200],  # Epochs for 16³, 32³, 64³
     device=device,
     embedding_cache=embedding_cache
 )

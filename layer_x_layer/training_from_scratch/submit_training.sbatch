@@ -30,4 +30,4 @@ echo "Starting training on node: $SLURMD_NODENAME"
 echo "GPU: $CUDA_VISIBLE_DEVICES"
 
 # Run the script
-python3 training_batch.py
+python3 patch_causal_train_v4.py --batch_size=20 --skip_cache_scan

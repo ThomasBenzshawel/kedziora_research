@@ -16,7 +16,7 @@ import traceback
 import dotenv
 
 # Set up logging
-def setup_logging(job_id: int = 1):
+def setup_logging(job_id: int = 1) -> logging.Logger:
     """Set up logging with job-specific log files."""
     log_filename = f'objaverse_download_job_{job_id}.log'
     logging.basicConfig(
@@ -648,6 +648,11 @@ def download_objaverse_xl_robust(
     logger.info(f"Job {job_id}: Loading Objaverse XL annotations")
     try:
         annotations = oxl.get_annotations()
+        
+        logger.info(f"Job {job_id}: Source distribution: {annotations['source'].value_counts().to_dict()}")
+        annotations = annotations[annotations['source'] != 'github']
+        logger.info(f"Job {job_id}: After filtering GitHub: {len(annotations)} objects remaining")
+        
     except Exception as e:
         logger.error(f"Job {job_id}: Failed to load annotations: {e}")
         return {'error': str(e)}
@@ -660,6 +665,8 @@ def download_objaverse_xl_robust(
         filtered = annotations
         logger.info(f"Job {job_id}: Using all {len(filtered)} objects")
     
+    
+
     if len(filtered) == 0:
         logger.warning(f"Job {job_id}: No objects found with file types: {file_types}")
         return {'error': f'No objects found with file types: {file_types}'}
@@ -1056,20 +1063,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-objects",
         type=int,
-        default=100000,
-        help="Number of objects to download. Default: 100000",
+        default=1000000,
+        help="Number of objects to download. Default: 1000000",
     )
     parser.add_argument(
         "--file-types",
         nargs='+',
-        default=['glb', 'obj', 'dae', 'gltf', 'stl'],
+        default=['glb', 'obj', 'stl'],
         help="File types to download for XL dataset (e.g., glb obj fbx). Default: glb",
     )
     parser.add_argument(
         "--save-repos",
         action="store_true",
-        default=False,
-        help="Save GitHub repositories as files (XL only). Default: False",
+        default=True,
+        help="Save GitHub repositories as files (XL only). Default: True",
     )
     parser.add_argument(
         "--temp-dir",
@@ -1147,7 +1154,7 @@ if __name__ == "__main__":
             xl=args.xl,
             num_objects=args.num_objects,
             file_types=args.file_types,
-            save_repos=False,
+            save_repos=args.save_repos,
             temp_dir=args.temp_dir,
             batch_size=args.batch_size,
             start_offset=args.start_offset,
