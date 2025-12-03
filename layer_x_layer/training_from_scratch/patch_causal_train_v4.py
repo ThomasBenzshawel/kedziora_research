@@ -8,6 +8,7 @@ from difflib import get_close_matches
 from functools import lru_cache
 from datetime import timedelta
 
+
 import numpy as np
 from numpy.random import RandomState
 
@@ -97,8 +98,6 @@ def parse_args():
                         help='Use mixed precision training (bfloat16 or float16)')
     
     # Training hyperparameters
-    parser.add_argument('--num_epochs', type=int, default=500,
-                        help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=128,
                         help='Override batch size (per GPU)')
     parser.add_argument('--learning_rate', type=float, default=None,
@@ -115,7 +114,7 @@ def parse_args():
         help='Skip scanning datasets for uncached T5 embeddings (use when cache is complete)')
     parser.add_argument('--granularities', type=int, nargs='+', default=[16, 32, 64],
                         help='List of granularities for progressive training (e.g., 16 32 64)')
-    parser.add_argument('--epochs_per_stage', type=int, nargs='+', default=[500, 250, 200],
+    parser.add_argument('--epochs_per_stage', type=int, nargs='+', default=[20, 20, 20],
                         help='Number of epochs for each granularity stage (e.g., 500 250 200)')
     parser.add_argument('--parallel_training', type=bool, default=True,
                         help='Use parallel training for the noise prediction model')
@@ -146,7 +145,7 @@ def setup_distributed():
     dist.init_process_group(
         backend='nccl',
         init_method='env://',
-        timeout=datetime.timedelta(hours=10)  # Add timeout
+        timeout=timedelta(hours=10)  # Add timeout
     )
     
     # Register cleanup handlers
@@ -287,7 +286,7 @@ class T5EmbeddingCache:
     Drop-in replacement for both HDF5 and SQL versions.
     """
     
-    def __init__(self, cache_dir='./t5_cache', max_length=77, memory_cache_size=1000):
+    def __init__(self, cache_dir='./t5_cache', max_length=77, memory_cache_size=1000, allow_disk_write=True):
         """
         Initialize T5 embedding cache with SQLite backend.
         
@@ -307,6 +306,7 @@ class T5EmbeddingCache:
         # Small LRU cache for frequently accessed embeddings
         self._memory_cache = {}
         self._cache_order = []
+        self.allow_disk_write = allow_disk_write
         
         # Initialize database
         self._init_db()
@@ -387,13 +387,13 @@ class T5EmbeddingCache:
         count = cursor.fetchone()[0]
         conn.close()
         print(f"Database contains {count:,} cached embeddings")
-    
+        
     def get_embedding(self, text):
         key = self._get_cache_key(text)
         
         # Check memory cache first
         if key in self._memory_cache:
-            return self._memory_cache[key]
+            return self._memory_cache[key].clone()
         
         # Check disk cache
         conn = sqlite3.connect(str(self.db_path))
@@ -404,41 +404,40 @@ class T5EmbeddingCache:
         
         if result is not None:
             embedding = torch.from_numpy(
-            np.frombuffer(result[0], dtype=np.float16).reshape(self.max_length, 768).copy()
-        )
+                np.frombuffer(result[0], dtype=np.float16).reshape(self.max_length, 768).copy()
+            )
             self._add_to_memory_cache(key, embedding)
             return embedding.clone()
         
         # CACHE MISS - compute on-the-fly
-        print(f"Cache miss for text: {text[:50]}...")
         if self.model is None or self.tokenizer is None:
             return None
-        else:
-            model_device = next(self.model.parameters()).device
-            
-            # Send inputs to the SAME device as the model
-            text_input = self.tokenizer(
-                text,
-                padding='max_length',
-                max_length=self.max_length,
-                truncation=True,
-                return_tensors='pt'
-            ).to(model_device)
-                    
+        
+        print(f"Cache miss for text: {text[:50]}...")
+        model_device = next(self.model.parameters()).device
+        
+        text_input = self.tokenizer(
+            text,
+            padding='max_length',
+            max_length=self.max_length,
+            truncation=True,
+            return_tensors='pt'
+        ).to(model_device)
+        
+        with torch.no_grad():
             embedding = self.model(
                 input_ids=text_input.input_ids,
                 attention_mask=text_input.attention_mask
-            ).last_hidden_state
-            
-            # Cache and return (will be on CPU after add_embedding)
-            self.add_embedding(text, embedding.squeeze(0))
-            
-            # Cleanup
-            del text_input
-
-            embedding_cpu = embedding.squeeze(0).cpu()
-
-            return embedding_cpu.clone()
+            ).last_hidden_state.squeeze(0).cpu()
+        
+        # Only write to disk if allowed (not during distributed training)
+        if self.allow_disk_write:
+            self.add_embedding(text, embedding)
+        else:
+            # Memory-only cache - survives this run but not persisted
+            self._add_to_memory_cache(key, embedding)
+        
+        return embedding.clone()
 
     def add_embedding(self, text, embedding):
         """
@@ -2075,7 +2074,7 @@ class LayerXLayerDiffusionTrainerV4:
         """
         if backward:
             self.model.train()
-            self.optimizer.zero_grad(set_to_none=True))
+            self.optimizer.zero_grad(set_to_none=True)
         else:
             self.model.eval()
         model = self.unwrapped_model
@@ -2611,7 +2610,7 @@ class FSDPProgressiveGranularityTrainer:
                 npy_folder_path=f'/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_voxels/{granularity}',
                 description_folder_path='/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_descriptions',
                 granularity=granularity,
-                test_count=0,  # Adjust as needed
+                test_count=400,  # Adjust as needed
                 enable_fuzzy_matching=args.enable_fuzzy_matching
             )
             
@@ -3051,15 +3050,15 @@ class FSDPProgressiveGranularityTrainer:
             model = FSDP(model, **fsdp_config)
 
         if args.use_ddp:
-        print_main("Wrapping model with DDP")
-        model = DDP(
-            model, 
-            device_ids=[local_rank],  # Use local_rank (int), not device
-            output_device=local_rank,
-            find_unused_parameters=False,  # Set True if you have unused params (slower)
-            gradient_as_bucket_view=True,  # Memory optimization
-            broadcast_buffers=True,  # Sync batch norm stats etc.
-        )
+            print_main("Wrapping model with DDP")
+            model = DDP(
+                model, 
+                device_ids=[local_rank],  # Use local_rank (int), not device
+                output_device=local_rank,
+                find_unused_parameters=False,  # Set True if you have unused params (slower)
+                gradient_as_bucket_view=True,  # Memory optimization
+                broadcast_buffers=True,  # Sync batch norm stats etc.
+            )
 
         # model = torch.compile(model, mode='max-autotune', fullgraph=True)
         
@@ -3690,7 +3689,7 @@ def create_distributed_dataloaders(train_dataset, val_dataset, batch_size):
             num_replicas=world_size,
             rank=rank,
             shuffle=False,
-            drop_last=True  # CRITICAL: Prevents hanging on last batch
+            drop_last=True  
         )
         
         shuffle_train = False
@@ -3774,24 +3773,52 @@ print_main(f"T5 model loaded with {sum(p.numel() for p in t5_model.parameters())
 print_main("\n" + "="*60)
 print_main("Setting up T5 Embedding Cache")
 print_main("="*60)
-embedding_cache = T5EmbeddingCache(cache_dir='./t5_cache', max_length=77)
-embedding_cache.load_cache()  # Load existing cache if available
 
-# Precompute embeddings for all descriptions in both train and val datasets
+# Step 1: Create cache on rank 0's master database
+embedding_cache = T5EmbeddingCache(cache_dir='./t5_cache', max_length=77, allow_disk_write=rank==0)
+embedding_cache.load_cache()
+
+# Step 2: Precompute embeddings (only rank 0 writes to master DB)
 if not args.skip_cache_scan:
-    print_main("Precomputing embeddings for training dataset...")
-    embedding_cache.precompute_embeddings(
-        texts=train_dataset_3d,  # Pass dataset directly
-        tokenizer=t5_tokenizer,
-        model=t5_model,
-        device=device,
-        batch_size=256
-    )
+    if rank == 0:  # Only rank 0 precomputes
+        print_main("Precomputing embeddings for training dataset...")
+        embedding_cache.precompute_embeddings(
+            texts=train_dataset_3d,
+            tokenizer=t5_tokenizer,
+            model=t5_model,
+            device=device,
+            batch_size=256
+        )
+    
+    # Wait for rank 0 to finish
+    if is_distributed:
+        dist.barrier()
 else:
     print_main("Skipping cache scan (--skip_cache_scan flag set)")
 
+# Step 3: NOW copy the completed database to per-rank files
+if is_distributed:
+    import shutil
+    rank_db_path = Path(f'./t5_cache/embeddings_rank{rank}.db')
+    
+    if rank != 0:
+        # Copy the master database (which now has all embeddings)
+        shutil.copy(embedding_cache.db_path, rank_db_path)
+        embedding_cache.db_path = rank_db_path
+        print(f"[Rank {rank}] Using database copy: {rank_db_path}")
+    
+    # Reinitialize connection to the (possibly new) database
+    embedding_cache._init_db()
+    
+    dist.barrier()  # Ensure all copies complete before training
+
+print_main("✓ T5 embeddings cached! Each rank has its own database copy.\n")
+
 train_dataset_3d.save_miss_report(output_path='train_description_miss_report.txt')
 print("Saved miss reports for datasets.")
+
+if is_distributed:
+    dist.barrier()
 
 # Free T5 model from GPU to save memory (embeddings are now cached)
 t5_model = t5_model.cpu()
