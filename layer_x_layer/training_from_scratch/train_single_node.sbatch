@@ -145,8 +145,8 @@ CMD="torchrun \
     --batch_size $BATCH_SIZE \
     --validation_interval $VALIDATION_INTERVAL \
     --checkpoint_interval $CHECKPOINT_INTERVAL \
-    --skip_cache_scan
     "
+    # --skip_cache_scan
 
 # Add CPU offload flag if enabled
 if [ "$USE_CPU_OFFLOAD" = "true" ]; then
