@@ -1,4 +1,3 @@
-from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Union
 import math
@@ -7,6 +6,7 @@ import os
 import json
 from difflib import get_close_matches
 from functools import lru_cache
+from datetime import timedelta
 
 import numpy as np
 from numpy.random import RandomState
@@ -152,6 +152,7 @@ def setup_distributed():
     dist.init_process_group(
         backend='nccl',  # Use NCCL for GPU communication
         init_method='env://',
+        timeout=timedelta(hours=8),
     )
     
     return True, rank, world_size, local_rank
@@ -655,6 +656,8 @@ def load_pretrained_encoder(model, encoder_checkpoint_path):
             k.replace('_orig_mod.', ''): v 
             for k, v in encoder_state_dict.items()
         }
+
+    model = model.module if hasattr(model, 'module') else model
     
     # Load into model's low_res_encoder
     model.low_res_encoder.load_state_dict(encoder_state_dict, strict=True)
@@ -2010,6 +2013,12 @@ class LayerXLayerDiffusionTrainerV4:
         else:
             self.scheduler = None
 
+    @property
+    def unwrapped_model(self):
+        """Get the underlying model, unwrapping DDP/FSDP if necessary"""
+        if hasattr(self.model, 'module'):
+            return self.model.module
+        return self.model
 
     def train_step(self, x0, context, low_res_context=None):
         """Training step with backward pass."""
@@ -2033,7 +2042,7 @@ class LayerXLayerDiffusionTrainerV4:
             self.optimizer.zero_grad()
         else:
             self.model.eval()
-        
+        model = self.unwrapped_model
         B, C, H, W, D = x0.shape
         device = x0.device
         model_dtype = next(self.model.parameters()).dtype
@@ -2055,14 +2064,13 @@ class LayerXLayerDiffusionTrainerV4:
             x_noisy[:, l] = sqrt_alpha * all_layers[:, l] + sqrt_one_minus * noise[:, l]
         
         low_res_features = None
-        if low_res_context is not None and self.model.use_low_res_context:
+        if low_res_context is not None and model.use_low_res_context:
             with torch.no_grad():
-                low_res_features = self.model.low_res_encoder(
+                low_res_features = model.low_res_encoder(
                     low_res_context.to(model_dtype), L
                 ).detach()
         
-        model = self.model.module if hasattr(self.model, 'module') else self.model
-        predicted_noise = model.forward_parallel(
+        predicted_noise = model(
             x_noisy, t_all, context.to(model_dtype), all_layers,
             low_res_features=low_res_features
         )
@@ -2103,23 +2111,24 @@ class LayerXLayerDiffusionTrainerV4:
         model_dtype = next(self.model.parameters()).dtype
         total_loss = 0
         prev_layers_list = []
-        
+        model = self.unwrapped_model
+
         # Prepare low-res features
         low_res_features = None
-        if low_res_context is not None and self.model.use_low_res_context:
+        if low_res_context is not None and model.use_low_res_context:
             with torch.no_grad():
                 low_res_features = self.model.low_res_encoder(
                     low_res_context.to(model_dtype),
-                    self.model.granularity
+                    model.granularity
                 ).detach()
 
         # Determine chunk to train on
         if chunk_divide is None:
-            chunk_size = self.model.granularity
+            chunk_size = model.granularity
             start_layer = 0
         else:
-            chunk_size = self.model.granularity // chunk_divide
-            start_layer = random.randint(0, self.model.granularity - chunk_size)
+            chunk_size = model.granularity // chunk_divide
+            start_layer = random.randint(0, model.granularity - chunk_size)
 
         for layer_idx in range(start_layer, start_layer + chunk_size):           
             current_layer = x0[:, :, :, :, layer_idx].to(model_dtype)
@@ -2129,7 +2138,7 @@ class LayerXLayerDiffusionTrainerV4:
             
             # Build prev_layers
             if len(prev_layers_list) > 0:
-                max_context = self.model.max_context_layers
+                max_context = model.max_context_layers
                 if max_context is not None and len(prev_layers_list) > max_context:
                     prev_layers = torch.stack(prev_layers_list[-max_context:], dim=1)
                 else:
@@ -2138,7 +2147,6 @@ class LayerXLayerDiffusionTrainerV4:
                 prev_layers = None
             
             # Forward pass (single layer)
-            model = self.model.module if hasattr(self.model, 'module') else self.model
             predicted_noise = model(xt, t, l, context, prev_layers, 
                                         low_res_features=low_res_features)
                 
@@ -2178,13 +2186,15 @@ class LayerXLayerDiffusionTrainerV4:
         """
         DDIM sampling with full cross-attention.
         """
-        self.model.eval()
-        model_dtype = next(self.model.parameters()).dtype
+        
+        model = self.unwrapped_model
+        model.eval()
+        model_dtype = next(model.parameters()).dtype
+
         with torch.no_grad():
             batch_size = shape[0]
             voxel_grid = torch.zeros((batch_size, shape[1], shape[2], shape[3], 
-                                     self.model.granularity), device=device, dtype=model_dtype)
-
+                                     model.granularity), device=device, dtype=model_dtype)
             # Create DDIM timesteps
             timestep_interval = self.diffusion.timesteps // ddim_steps
             ddim_timesteps = list(range(0, self.diffusion.timesteps, timestep_interval))
@@ -2192,7 +2202,7 @@ class LayerXLayerDiffusionTrainerV4:
             
             generated_layers = []
 
-            for layer_idx in range(self.model.granularity):
+            for layer_idx in range(model.granularity):
                 l = torch.full((batch_size,), layer_idx, device=device, dtype=model_dtype)
                 x = torch.randn(shape, device=device, dtype=model_dtype)
 
@@ -2204,7 +2214,6 @@ class LayerXLayerDiffusionTrainerV4:
                 
                 for i, t in enumerate(ddim_timesteps):
                     t_batch = torch.full((batch_size,), t, device=device, dtype=model_dtype)
-                    model = self.model.module if hasattr(self.model, 'module') else self.model
                     predicted_noise = model(x, t_batch, l, context, prev_layers)
                     
                     # DDIM update rule
@@ -3540,8 +3549,10 @@ class TrainingVoxelVisualizer:
             prev_layer_features = None
             shape = (num_samples, 1, granularity, granularity)
 
+            model = trainer.model.module if hasattr(trainer.model, 'module') else trainer.model
+
             voxel_grid = torch.zeros((batch_size, shape[1], shape[2], shape[3],
-                                      trainer.model.granularity), device=device, dtype=model_dtype)
+                                      model.granularity), device=device, dtype=model_dtype)
 
             # Create subset of timesteps for DDIM
             timestep_interval = trainer.diffusion.timesteps // trainer.ddim_steps
@@ -3549,7 +3560,7 @@ class TrainingVoxelVisualizer:
             ddim_timesteps.reverse()
             
             # Progress bar for layers
-            layer_pbar = tqdm(range(trainer.model.granularity), desc="Generating layers (DDIM)", unit="layer")
+            layer_pbar = tqdm(range(model.granularity), desc="Generating layers (DDIM)", unit="layer")
             generated_layers = []
             for layer_idx in layer_pbar:
                 l = torch.full((batch_size,), layer_idx, device=device, dtype=model_dtype)
@@ -3558,7 +3569,7 @@ class TrainingVoxelVisualizer:
                 # Progress bar for DDIM timesteps
                 timestep_pbar = tqdm(
                     enumerate(ddim_timesteps),
-                    desc=f"  Layer {layer_idx+1}/{trainer.model.granularity} DDIM",
+                    desc=f"  Layer {layer_idx+1}/{model.granularity} DDIM",
                     leave=False,
                     total=len(ddim_timesteps),
                     unit="step"
@@ -3568,8 +3579,7 @@ class TrainingVoxelVisualizer:
                     t_batch = torch.full((batch_size,), t, device=device, dtype=model_dtype)
                     if len(generated_layers) > 0:
                         prev_layer_features = torch.stack(generated_layers, dim=1)
-                    model = trainer.model.module if hasattr(trainer.model, 'module') else trainer.model
-                    predicted_noise = trainer.model(
+                    predicted_noise = model(
                         x, t_batch, l, context, prev_layer_features
                     )
                     
@@ -3603,7 +3613,7 @@ class TrainingVoxelVisualizer:
                 voxel_grid[:, :, :, :, layer_idx] = x
                 
                 # Update layer progress bar with completion percentage
-                layer_pbar.set_postfix({'completed': f'{((layer_idx+1)/trainer.model.granularity)*100:.1f}%'})
+                layer_pbar.set_postfix({'completed': f'{((layer_idx+1)/model.granularity)*100:.1f}%'})
             
             layer_pbar.close()
             return voxel_grid.clamp(0, 1)
