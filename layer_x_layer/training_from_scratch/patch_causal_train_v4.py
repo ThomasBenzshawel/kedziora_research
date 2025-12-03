@@ -8,7 +8,6 @@ from difflib import get_close_matches
 from functools import lru_cache
 from datetime import timedelta
 
-
 import numpy as np
 from numpy.random import RandomState
 
@@ -145,7 +144,7 @@ def setup_distributed():
     dist.init_process_group(
         backend='nccl',
         init_method='env://',
-        timeout=timedelta(hours=10)  # Add timeout
+        timeout=timedelta(hours=24)  # Add timeout
     )
     
     # Register cleanup handlers
@@ -260,7 +259,7 @@ def get_fsdp_config():
         'sharding_strategy': sharding_strategy,
         'cpu_offload': cpu_offload,
         'mixed_precision': mixed_precision,
-        'auto_wrap_policy': None,
+        'auto_wrap_policy': auto_wrap_policy,
         'backward_prefetch': BackwardPrefetch.BACKWARD_PRE,
         'device_id': torch.cuda.current_device(),
         'sync_module_states': True,
@@ -625,10 +624,9 @@ class T5EmbeddingCache:
         cursor.execute('SELECT COUNT(*) FROM embeddings')
         total_cached = cursor.fetchone()[0]
         
-        cursor.execute('SELECT pg_size FROM pragma_page_size()')
+        cursor.execute('PRAGMA page_size')
         page_size = cursor.fetchone()[0]
-        
-        cursor.execute('SELECT pg_count FROM pragma_page_count()')
+        cursor.execute('PRAGMA page_count')
         page_count = cursor.fetchone()[0]
         
         conn.close()
@@ -2920,6 +2918,7 @@ class FSDPProgressiveGranularityTrainer:
             low_res_contexts: Optional [B, 1, H, W, D] low-res conditioning from previous stage
         """
         model.eval()
+        model = model.module if hasattr(model, 'module') else model
         batch_size = shape[0]
         voxel_grid = torch.zeros(
             (batch_size, 1, granularity, granularity, granularity),
@@ -2942,7 +2941,6 @@ class FSDPProgressiveGranularityTrainer:
             # Run diffusion to convergence
             for t in reversed(range(diffusion.timesteps)):
                 t_batch = torch.full((batch_size,), t, dtype=MASTER_DTYPE, device=device)
-                model = model.module if hasattr(model, 'module') else model
                 predicted_noise = model(
                     x, t_batch, l, context, prev_layers,
                     low_res_features=low_res_contexts,
@@ -3146,6 +3144,7 @@ class FSDPProgressiveGranularityTrainer:
                     if torch.cuda.is_available():
                         peak_memory = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
                         print(f"Peak Memory: {peak_memory:.2f} GB")
+
                 if is_distributed:
                     dist.barrier()
                     
@@ -3801,16 +3800,18 @@ if is_distributed:
     import shutil
     rank_db_path = Path(f'./t5_cache/embeddings_rank{rank}.db')
     
+    # Close existing connection first
+    if hasattr(embedding_cache, '_conn'):
+        embedding_cache._conn.close()
+    
+    dist.barrier()  # Ensure rank 0 has finished writing
+    
     if rank != 0:
-        # Copy the master database (which now has all embeddings)
         shutil.copy(embedding_cache.db_path, rank_db_path)
         embedding_cache.db_path = rank_db_path
-        print(f"[Rank {rank}] Using database copy: {rank_db_path}")
     
-    # Reinitialize connection to the (possibly new) database
-    embedding_cache._init_db()
-    
-    dist.barrier()  # Ensure all copies complete before training
+    dist.barrier()  # Ensure all copies complete
+    embedding_cache._init_db()  # Reinitialize connection
 
 print_main("✓ T5 embeddings cached! Each rank has its own database copy.\n")
 
