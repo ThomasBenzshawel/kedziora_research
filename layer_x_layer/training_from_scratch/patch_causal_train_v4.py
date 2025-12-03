@@ -125,42 +125,61 @@ def parse_args():
 # Parse arguments
 args = parse_args()
 
+import atexit
+import signal
 
 def setup_distributed():
-    """
-    Initialize distributed training environment for FSDP.
-    Returns: (is_distributed, rank, world_size, local_rank)
-    """
     if not args.shard_model and not args.use_ddp:
         return False, 0, 1, 0
     
-    # Check if launched with torchrun/torch.distributed.launch
     if 'RANK' not in os.environ or 'WORLD_SIZE' not in os.environ:
-        print("ERROR: --shard_model requires running with torchrun or torch.distributed.launch")
-        print("Example: torchrun --nproc_per_node=auto train.py --shard_model")
+        print("ERROR: Distributed training requires torchrun or torch.distributed.launch")
         exit(1)
     
-    # Get distributed training parameters from environment
     rank = int(os.environ['RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
     local_rank = int(os.environ['LOCAL_RANK'])
     
-    # Set the device for this process
     torch.cuda.set_device(local_rank)
     
-    # Initialize the process group
+    # Initialize with timeout to prevent hanging
     dist.init_process_group(
-        backend='nccl',  # Use NCCL for GPU communication
+        backend='nccl',
         init_method='env://',
-        timeout=timedelta(hours=8),
+        timeout=datetime.timedelta(hours=10)  # Add timeout
     )
+    
+    # Register cleanup handlers
+    def cleanup():
+        if dist.is_initialized():
+            dist.destroy_process_group()
+    
+    atexit.register(cleanup)
+    
+    # Handle signals for clean shutdown
+    def signal_handler(signum, frame):
+        cleanup()
+        exit(1)
+    
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
     
     return True, rank, world_size, local_rank
 
 # GLOBAL VARS
-MASTER_DTYPE = torch.float16
+MASTER_DTYPE = torch.float32
 is_distributed, rank, world_size, local_rank = setup_distributed()
 
+def set_seed(seed, rank=0):
+    """Set seeds for reproducibility across ranks"""
+    seed = seed + rank  # Different seed per rank for data augmentation
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+set_seed(42, rank)
 # Set device based on distributed mode
 if is_distributed:
     device = torch.device(f"cuda:{local_rank}")
@@ -1787,8 +1806,13 @@ class LayerXLayerDiffusionModelV4(nn.Module):
             nn.SiLU(),
             nn.Conv2d(model_channels, in_channels, 3, padding=1)
         )
+    def forward(self, *args, parallel_mode=True, **kwargs):
+        if parallel_mode:
+            return self.forward_parallel(*args, **kwargs)
+        else:
+            return self.forward_sequential(*args, **kwargs)
 
-    def forward(self, x, t, l, context, prev_layers=None, low_res_features=None):
+    def forward_sequential(self, x, t, l, context, prev_layers=None, low_res_features=None):
         """
         Single-layer forward pass (for inference/sequential).
         Maintains compatibility with V3 interface.
@@ -1972,14 +1996,26 @@ class LayerXLayerDiffusionTrainerV4:
         """
         self.model = model
         self.diffusion = diffusion
-        lr = args.learning_rate if args.learning_rate is not None else 1e-4
-        self.optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
-        self.teacher_forcing = teacher_forcing
+        base_lr = args.learning_rate if args.learning_rate is not None else 1e-4
+        
+        if is_distributed:
+            # Linear scaling: lr = base_lr * world_size
+            # Or square root scaling: lr = base_lr * sqrt(world_size)
+            scaled_lr = base_lr * world_size  # Linear scaling
+            # scaled_lr = base_lr * math.sqrt(world_size)  # Square root scaling (more conservative)
+            print_main(f"Scaling learning rate: {base_lr} -> {scaled_lr} (world_size={world_size})")
+        else:
+            scaled_lr = base_lr
+        
+        self.optimizer = torch.optim.AdamW(model.parameters(), lr=scaled_lr, weight_decay=0.01)
         self.use_ddim = use_ddim
         self.ddim_steps = ddim_steps
         self.ddim_eta = ddim_eta
         self.low_res_contexts = low_res_contexts or {}
         self.parallel_training = parallel_training
+        self.teacher_forcing = teacher_forcing
+        if args.use_ddp and args.mixed_precision:
+            self.scaler = GradScaler('cuda')
 
         if use_scheduler:
             num_warmup_steps = 1000
@@ -2039,7 +2075,7 @@ class LayerXLayerDiffusionTrainerV4:
         """
         if backward:
             self.model.train()
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True))
         else:
             self.model.eval()
         model = self.unwrapped_model
@@ -2082,11 +2118,11 @@ class LayerXLayerDiffusionTrainerV4:
         
         if backward:
             if args.use_ddp and args.mixed_precision:
-                scaler.scale(loss).backward()
-                scaler.unscale_(self.optimizer)
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
-                scaler.step(self.optimizer)
-                scaler.update()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
             else:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
@@ -2102,7 +2138,7 @@ class LayerXLayerDiffusionTrainerV4:
         """
         if backward:
             self.model.train()
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
         else:
             self.model.eval()
         
@@ -2148,13 +2184,13 @@ class LayerXLayerDiffusionTrainerV4:
             
             # Forward pass (single layer)
             predicted_noise = model(xt, t, l, context, prev_layers, 
-                                        low_res_features=low_res_features)
+                                        low_res_features=low_res_features, parallel_mode=False)
                 
             loss = F.mse_loss(predicted_noise.float(), noise.float())
             
             if backward:
                 if args.use_ddp and args.mixed_precision:
-                    scaler.scale(loss).backward()
+                    self.scaler.scale(loss).backward()
                 else:
                     loss.backward()
                 total_loss += loss.item()
@@ -2214,7 +2250,7 @@ class LayerXLayerDiffusionTrainerV4:
                 
                 for i, t in enumerate(ddim_timesteps):
                     t_batch = torch.full((batch_size,), t, device=device, dtype=model_dtype)
-                    predicted_noise = model(x, t_batch, l, context, prev_layers)
+                    predicted_noise = model(x, t_batch, l, context, prev_layers, parallel_mode=False)
                     
                     # DDIM update rule
                     alpha_hat_t = self.diffusion.alpha_hats[t]
@@ -2440,6 +2476,8 @@ class FSDPProgressiveGranularityTrainer:
             'global_val_loss': [],  # All validation losses
             'global_epochs': [],  # Epoch numbers for global tracking
         }
+        if args.use_ddp and args.mixed_precision:
+            self.scaler = GradScaler('cuda')
 
     def plot_loss_curves(self, stage_idx, stage_metrics, global_epoch_offset, current_epoch):
         """
@@ -2628,20 +2666,12 @@ class FSDPProgressiveGranularityTrainer:
         }
 
     def save_stage_checkpoint(self, model, stage_idx, device):
-        """Properly save FSDP model state for future use"""
         granularity = self.granularities[stage_idx]
         
         if args.shard_model:
-            # Gather full state dict on rank 0
-            save_policy = FullStateDictConfig(
-                offload_to_cpu=True, 
-                rank0_only=True
-            )
-            with FSDP.state_dict_type(
-                model, 
-                StateDictType.FULL_STATE_DICT, 
-                save_policy
-            ):
+            # FSDP saving (your existing code is correct)
+            save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
                 if rank == 0:
                     state_dict = model.state_dict()
                     checkpoint_path = f'stage{stage_idx}_gran{granularity}.pth'
@@ -2652,8 +2682,23 @@ class FSDPProgressiveGranularityTrainer:
                     }, checkpoint_path)
                     self.stage_checkpoints[stage_idx] = checkpoint_path
                     print(f"✓ Stage {stage_idx} checkpoint saved: {checkpoint_path}")
+        
+        elif args.use_ddp:
+            # DDP saving - only rank 0, unwrap model
+            if rank == 0:
+                checkpoint_path = f'stage{stage_idx}_gran{granularity}.pth'
+                # Get unwrapped model state dict
+                unwrapped_model = model.module if hasattr(model, 'module') else model
+                torch.save({
+                    'model_state_dict': unwrapped_model.state_dict(),  # No module. prefix
+                    'granularity': granularity,
+                    'stage_idx': stage_idx
+                }, checkpoint_path)
+                self.stage_checkpoints[stage_idx] = checkpoint_path
+                print(f"✓ Stage {stage_idx} checkpoint saved: {checkpoint_path}")
+        
         else:
-            # Non-FSDP case
+            # Non-distributed saving
             checkpoint_path = f'stage{stage_idx}_gran{granularity}.pth'
             torch.save({
                 'model_state_dict': model.state_dict(),
@@ -2667,9 +2712,9 @@ class FSDPProgressiveGranularityTrainer:
             dist.barrier()
             # Broadcast checkpoint path to all ranks
             if rank == 0:
-                path_list = [self.stage_checkpoints[stage_idx]]
+                path_list = [self.stage_checkpoints.get(stage_idx, "")]
             else:
-                path_list = [None]
+                path_list = [""]
             dist.broadcast_object_list(path_list, src=0)
             self.stage_checkpoints[stage_idx] = path_list[0]
 
@@ -2898,10 +2943,11 @@ class FSDPProgressiveGranularityTrainer:
             # Run diffusion to convergence
             for t in reversed(range(diffusion.timesteps)):
                 t_batch = torch.full((batch_size,), t, dtype=MASTER_DTYPE, device=device)
-                model = self.model.module if hasattr(self.model, 'module') else self.model
+                model = model.module if hasattr(model, 'module') else model
                 predicted_noise = model(
                     x, t_batch, l, context, prev_layers,
-                    low_res_features=low_res_contexts
+                    low_res_features=low_res_contexts,
+                    parallel_mode=False
                 )
                 
                 alpha_t = diffusion.alphas[t]
@@ -2944,6 +2990,10 @@ class FSDPProgressiveGranularityTrainer:
             prev_gran = self.granularities[stage_idx - 1]
             print_main(f"Using {prev_gran}³ as conditioning")
         print_main(f"{'='*60}\n")
+
+        if is_distributed:
+            dist.barrier()
+    
         
         # Precompute low-res contexts if needed
         low_res_contexts = {}
@@ -2960,6 +3010,9 @@ class FSDPProgressiveGranularityTrainer:
             'val_density': [],
             'epochs': list(range(1, epochs + 1))
         }
+
+        if is_distributed:
+            dist.barrier()
 
         # Create model
         print_main("Creating model...")
@@ -2997,15 +3050,24 @@ class FSDPProgressiveGranularityTrainer:
             fsdp_config = get_fsdp_config()
             model = FSDP(model, **fsdp_config)
 
-        elif args.use_ddp:
-            print_main("Wrapping model with DDP")
-            model = DDP(model, device_ids=[device])
+        if args.use_ddp:
+        print_main("Wrapping model with DDP")
+        model = DDP(
+            model, 
+            device_ids=[local_rank],  # Use local_rank (int), not device
+            output_device=local_rank,
+            find_unused_parameters=False,  # Set True if you have unused params (slower)
+            gradient_as_bucket_view=True,  # Memory optimization
+            broadcast_buffers=True,  # Sync batch norm stats etc.
+        )
 
         # model = torch.compile(model, mode='max-autotune', fullgraph=True)
         
         print_main("✓ Model created and compiled")
         print_main("Model has", sum(p.numel() for p in model.parameters()), "parameters")
 
+        if is_distributed:
+            dist.barrier()
         # Create corruption schedule and process 
         diffusion = ForwardDiffusion(timesteps=250, schedule='cosine')
 
@@ -3085,7 +3147,9 @@ class FSDPProgressiveGranularityTrainer:
                     if torch.cuda.is_available():
                         peak_memory = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
                         print(f"Peak Memory: {peak_memory:.2f} GB")
-
+                if is_distributed:
+                    dist.barrier()
+                    
                 # Generate visualizations (only rank 0)
                 if rank == 0:
                     print_main("\nGenerating validation visualizations...")
@@ -3152,19 +3216,15 @@ class FSDPProgressiveGranularityTrainer:
         return stage_metrics
         
     def _train_epoch(self, trainer, dataloader, embedding_cache, device, epoch, stage_idx):
-        """Training epoch with cached low-res contexts if needed for the current stage"""
         trainer.model.train()
-        epoch_loss = 0
+        epoch_loss = 0.0
         num_batches = 0
         
         for batch_idx, batch_data in enumerate(dataloader):
-            # Unpack with file stems
             x0, descriptions, file_stems = batch_data
-            
             x0 = x0.to(device, dtype=MASTER_DTYPE)
             context = embedding_cache.get_batch_embeddings(descriptions, device)
             
-            # Get precomputed low-res contexts using file stems for the batch if needed for this stage. The contexts should be already loaded in trainer.low_res_contexts
             low_res_batch = None
             if stage_idx > 0 and trainer.low_res_contexts:
                 low_res_batch = []
@@ -3174,9 +3234,7 @@ class FSDPProgressiveGranularityTrainer:
                             trainer.low_res_contexts[stem].to(device, dtype=MASTER_DTYPE).detach()
                         )
                     else:
-                        # This shouldn't happen if precomputation worked
                         print_main(f"⚠ Warning: Missing low-res context for {stem}")
-                        # Fallback: use zeros
                         low_res_batch.append(
                             torch.zeros(1, x0.shape[2], x0.shape[3], x0.shape[4],
                                     device=device, dtype=MASTER_DTYPE)
@@ -3185,51 +3243,48 @@ class FSDPProgressiveGranularityTrainer:
                 if low_res_batch:
                     low_res_batch = torch.stack(low_res_batch)
             
-            # Training step: Do the actual prediction, loss calculation, and backpropagation
             loss = trainer.train_step(x0, context, low_res_batch)
             epoch_loss += loss
             num_batches += 1
             
-            # The loss and info above is for purely reporting reasons
-
-            # Print progress every 50 batches (optional)
             if rank == 0 and (batch_idx + 1) % 50 == 0:
                 avg_loss = epoch_loss / num_batches
                 print(f"  Batch {batch_idx + 1}/{len(dataloader)} - Avg Loss: {avg_loss:.4f}")
         
         # Synchronize metrics across ranks
         if is_distributed:
-            metrics = torch.tensor([epoch_loss, num_batches], device=device)
+            # Use float64 for loss to avoid precision issues
+            metrics = torch.tensor([epoch_loss, float(num_batches)], 
+                                device=device, dtype=torch.float64)
             dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
             epoch_loss = metrics[0].item()
             num_batches = int(metrics[1].item())
         
-        avg_loss = epoch_loss / num_batches
+        avg_loss = epoch_loss / max(num_batches, 1)  # Avoid division by zero
         return {
             'train_loss': avg_loss,
             'num_batches': num_batches
         }
     
     def _validate_epoch(self, trainer, dataloader, embedding_cache, device, stage_idx):
-        """Validation epoch with comprehensive metrics"""
         trainer.model.eval()
-        val_loss = 0
-        total_occupancy = 0
-        total_density = 0
+        val_loss = 0.0
+        total_occupancy = 0.0
+        total_density = 0.0
         num_batches = 0
+        
+        # Determine max batches to process (same across all ranks)
+        max_val_batches = min(10, len(dataloader))
         
         with torch.no_grad():
             for batch_idx, batch_data in enumerate(dataloader):
-                if num_batches >= 10:
+                if batch_idx >= max_val_batches:
                     break
                 
-                # Unpack with file stems
                 x0, descriptions, file_stems = batch_data
-                
                 x0 = x0.to(device, dtype=MASTER_DTYPE)
                 context = embedding_cache.get_batch_embeddings(descriptions, device)
                 
-                # Get low-res contexts using file stems
                 low_res_batch = None
                 if stage_idx > 0 and trainer.low_res_contexts:
                     low_res_batch = []
@@ -3242,11 +3297,9 @@ class FSDPProgressiveGranularityTrainer:
                     if low_res_batch:
                         low_res_batch = torch.stack(low_res_batch)
                 
-                # Compute loss
                 batch_loss = trainer.compute_loss(x0, context, low_res_batch, backward=False)
                 val_loss += batch_loss
                 
-                # Compute occupancy and density
                 threshold = 0.5
                 occupancy = (x0 > threshold).float().mean().item()
                 density = x0.mean().item()
@@ -3255,10 +3308,12 @@ class FSDPProgressiveGranularityTrainer:
                 
                 num_batches += 1
         
-        # Synchronize across ranks
+        # Synchronize across ranks - ALL ranks must participate
         if is_distributed:
-            metrics = torch.tensor([val_loss, total_occupancy, total_density, num_batches], 
-                                device=device)
+            metrics = torch.tensor(
+                [val_loss, total_occupancy, total_density, float(num_batches)], 
+                device=device, dtype=torch.float64
+            )
             dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
             val_loss = metrics[0].item()
             total_occupancy = metrics[1].item()
@@ -3266,11 +3321,11 @@ class FSDPProgressiveGranularityTrainer:
             num_batches = int(metrics[3].item())
         
         return {
-            'val_loss': val_loss / num_batches if num_batches > 0 else float('inf'),
-            'val_occupancy': total_occupancy / num_batches if num_batches > 0 else 0,
-            'val_density': total_density / num_batches if num_batches > 0 else 0
+            'val_loss': val_loss / max(num_batches, 1),
+            'val_occupancy': total_occupancy / max(num_batches, 1),
+            'val_density': total_density / max(num_batches, 1)
         }
-    
+        
 class TrainingVoxelVisualizer:
     def __init__(self, save_dir, max_voxels=30000):
         """
@@ -3580,7 +3635,8 @@ class TrainingVoxelVisualizer:
                     if len(generated_layers) > 0:
                         prev_layer_features = torch.stack(generated_layers, dim=1)
                     predicted_noise = model(
-                        x, t_batch, l, context, prev_layer_features
+                        x, t_batch, l, context, prev_layer_features,
+                        parallel_mode=False
                     )
                     
                     # DDIM update rule
@@ -3619,41 +3675,33 @@ class TrainingVoxelVisualizer:
             return voxel_grid.clamp(0, 1)
         
 def create_distributed_dataloaders(train_dataset, val_dataset, batch_size):
-    """
-    Create DataLoaders with distributed sampling if in distributed mode.
-    
-    Args:
-        train_dataset: Training dataset
-        val_dataset: Validation dataset
-        batch_size: Batch size per GPU
-        
-    Returns:
-        train_loader, val_loader, train_sampler
-    """
     if is_distributed:
-        # Create distributed samplers
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=world_size,
             rank=rank,
             shuffle=True,
-            seed=42  # For reproducibility
+            seed=42,
+            drop_last=True  # Important for DDP to avoid uneven batches
         )
         
         val_sampler = DistributedSampler(
             val_dataset,
             num_replicas=world_size,
             rank=rank,
-            shuffle=False  # Don't shuffle validation
+            shuffle=False,
+            drop_last=True  # CRITICAL: Prevents hanging on last batch
         )
         
-        shuffle_train = False  # Sampler handles shuffling
+        shuffle_train = False
     else:
         train_sampler = None
         val_sampler = None
         shuffle_train = True
     
-    # Create DataLoaders
+    # Workers should be per-process, not multiplied by world_size
+    num_workers = min(4, os.cpu_count() // max(world_size, 1))
+
     def collate_fn(batch):
         """Custom collate to handle 3-tuple"""
         voxels = torch.stack([item[0] for item in batch])
@@ -3661,17 +3709,18 @@ def create_distributed_dataloaders(train_dataset, val_dataset, batch_size):
         file_stems = [item[2] for item in batch]  # Keep as list
         return voxels, descriptions, file_stems
     
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         sampler=train_sampler,
         shuffle=shuffle_train if train_sampler is None else False,
-        num_workers=4 * (world_size if is_distributed else 1),
+        num_workers=num_workers,  # Fixed
         pin_memory=True,
-        prefetch_factor=4,
+        prefetch_factor=2,  # Reduced from 4
         drop_last=True,
-        persistent_workers=True,
-        collate_fn=collate_fn  # ← Add custom collate
+        persistent_workers=True if num_workers > 0 else False,
+        collate_fn=collate_fn
     )
     
     val_loader = DataLoader(
@@ -3679,12 +3728,12 @@ def create_distributed_dataloaders(train_dataset, val_dataset, batch_size):
         batch_size=batch_size,
         sampler=val_sampler,
         shuffle=False,
-        num_workers=4 * (world_size if is_distributed else 1),
+        num_workers=num_workers,  # Fixed
         pin_memory=True,
-        drop_last=False,
-        prefetch_factor=4,
-        persistent_workers=True,
-        collate_fn=collate_fn  # ← Add custom collate
+        drop_last=True,  # Changed to True for DDP
+        prefetch_factor=2,
+        persistent_workers=True if num_workers > 0 else False,
+        collate_fn=collate_fn
     )
     
     return train_loader, val_loader, train_sampler
@@ -3759,8 +3808,7 @@ print_main("✓ T5 embeddings cached! Training will use cached embeddings for sp
 progressive_trainer = FSDPProgressiveGranularityTrainer(
     granularities=granularities
 )
-if args.use_ddp and args.mixed_precision:
-    scaler = GradScaler('cuda')
+
 # KICK OFF THE BIG TRAINING RUN and START TRAINING!
 results = progressive_trainer.train_all_stages(
     epochs_per_stage=epochs_per_stage,  # Epochs for 16³, 32³, 64³
