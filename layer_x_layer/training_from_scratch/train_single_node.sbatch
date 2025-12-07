@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1          # One task (torchrun will handle multi-GPU)
 #SBATCH --cpus-per-task=64           # CPUs for data loading (adjust based on GPU count)
 #SBATCH --mem=256G                   # Memory per node
-#SBATCH --gres=gpu:4                 # Request up to 4 GPUs (change to 2, 4, 8 as needed)
+#SBATCH --gres=gpu:2                 # Request up to 4 GPUs (change to 2, 4, 8 as needed)
 #SBATCH --partition=dgxh100       # GPU partition 
 #SBATCH --account=undergrad_research
 
@@ -62,9 +62,30 @@ mkdir -p t5_cache
 # Distributed Training Environment Variables
 # =============================================================================
 
-# Set master address and port for distributed training
+# Set master address for distributed training
 export MASTER_ADDR=$(hostname)
-export MASTER_PORT=29500
+
+# Find first available port in range 29500-29599
+export MASTER_PORT=$(python -c '
+import socket
+def find_free_port(start=29500, end=29599):
+    for port in range(start, end + 1):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(("", port))
+            s.close()
+            return port
+        except OSError:
+            continue
+    raise RuntimeError("No free port found in range {}-{}".format(start, end))
+print(find_free_port())
+')
+
+# Verify port was found
+if [ -z "$MASTER_PORT" ]; then
+    echo "ERROR: Failed to find available port, exiting"
+    exit 1
+fi
 
 # Additional NCCL tuning (optional, adjust based on your network)
 export NCCL_NSOCKS_PERTHREAD=4
@@ -74,6 +95,7 @@ export NCCL_TIMEOUT=7200            # 2 hours timeout for long operations
 # Set CUDA options
 export CUDA_LAUNCH_BLOCKING=0       # Asynchronous CUDA operations
 export TORCH_DISTRIBUTED_DEBUG=INFO # Set to DETAIL for more verbose output
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # OMP settings for better performance
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
@@ -107,8 +129,8 @@ TRAIN_SCRIPT="patch_causal_train_v4.py"
 NUM_GPUS=$SLURM_GPUS_ON_NODE
 
 # Training arguments
-BATCH_SIZE=512                  # Batch size per GPU
-VALIDATION_INTERVAL=10
+BATCH_SIZE=28  # Batch size per GPU
+VALIDATION_INTERVAL=5
 CHECKPOINT_INTERVAL=50
 
 # FSDP configuration
@@ -145,8 +167,12 @@ CMD="torchrun \
     --batch_size $BATCH_SIZE \
     --validation_interval $VALIDATION_INTERVAL \
     --checkpoint_interval $CHECKPOINT_INTERVAL \
+    --test_run \
+    --no_teacher_forcing
     "
-    # --skip_cache_scan
+    # --skip_cache_scan \
+    # --test_run \
+    # --no_teacher_forcing
 
 # Add CPU offload flag if enabled
 if [ "$USE_CPU_OFFLOAD" = "true" ]; then

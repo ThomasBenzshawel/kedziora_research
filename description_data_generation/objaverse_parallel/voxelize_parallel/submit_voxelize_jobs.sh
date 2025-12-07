@@ -64,9 +64,8 @@ if [ "$SKIP_PREPROCESSING" = false ]; then
         --output=logs/preprocess_%j.out \
         --error=logs/preprocess_%j.err \
         --ntasks=1 \
-        --cpus-per-task=2 \
-        --mem=32G \
-        --time=02:00:00 \
+        --cpus-per-task=4 \
+        --mem=64G \
         --partition=teaching \
         --account=undergrad_research \
         <<'EOFPREPROCESS'
@@ -87,7 +86,7 @@ python --version
 
 python3 preprocess_file_list.py \
     --scan_dir '/home/ad.msoe.edu/benzshawelt/.objaverse' \
-    --scan_dir_2 '/home/ad.msoe.edu/benzshawelt/objaverse_temp' \
+    --scan_dir_2 '/data/ur/kedziora/layer_x_layer/objaverse_xl' \
     --output_file 'logs/glb_file_list.json'
 
 EXIT_CODE=$?

@@ -28,11 +28,17 @@ def setup_logging():
     )
     return logging.getLogger(__name__)
 
-
 def rotation_matrix_from_vectors(vec1, vec2):
     """Find rotation matrix that aligns vec1 to vec2"""
-    a = vec1 / np.linalg.norm(vec1)
-    b = vec2 / np.linalg.norm(vec2)
+    norm1 = np.linalg.norm(vec1)
+    norm2 = np.linalg.norm(vec2)
+    
+    # Handle zero-length vectors
+    if norm1 < 1e-10 or norm2 < 1e-10:
+        return np.eye(3)
+    
+    a = vec1 / norm1
+    b = vec2 / norm2
     v = np.cross(a, b)
     c = np.dot(a, b)
     s = np.linalg.norm(v)
@@ -41,7 +47,7 @@ def rotation_matrix_from_vectors(vec1, vec2):
         if c > 0:
             return np.eye(3)
         else:
-            # Find an orthogonal vector
+            # 180-degree rotation
             if abs(a[0]) < 0.9:
                 orthogonal = np.array([1, 0, 0])
             else:
@@ -53,7 +59,6 @@ def rotation_matrix_from_vectors(vec1, vec2):
     kmat = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
     rotation_matrix = np.eye(3) + kmat + kmat.dot(kmat) * ((1 - c) / (s ** 2))
     return rotation_matrix
-
 
 def compute_pca_rotation(vertices):
     """Compute PCA-based rotation matrix"""
@@ -301,6 +306,14 @@ def glb_to_voxel_tensor(glb_path, output_path, metadata_path, voxel_resolution=6
                 gc.collect()
             else:
                 raise ValueError(f"Unsupported mesh type: {type(mesh)}")
+        
+        # NOW clean the mesh (after we know it's a Trimesh)
+        mask = mesh.unique_faces() & mesh.nondegenerate_faces(height=1e-8)
+        mesh.update_faces(mask)
+        
+        mesh.remove_unreferenced_vertices()
+        mesh.merge_vertices()
+        mesh.fix_normals()
         
         # Validate mesh before processing
         if len(mesh.vertices) == 0:

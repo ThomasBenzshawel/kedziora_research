@@ -12,7 +12,7 @@ import argparse
 import sys
 from pathlib import Path
 import threading
-from datetime import import
+from datetime import datetime
 import shutil
 import gc
 import multiprocessing as mp
@@ -308,49 +308,55 @@ def process_single_render(args):
     import cv2
     import gc
     
-    def is_scene_empty(scene):
-        """Check if a loaded scene is empty or invalid."""
-        try:
-            if scene is None:
-                return True
-            
-            if hasattr(scene, 'is_empty') and scene.is_empty:
-                return True
-            
-            if hasattr(scene, 'vertices'):
-                if scene.vertices is None or len(scene.vertices) == 0:
-                    return True
-            
-            if hasattr(scene, 'geometry'):
-                if len(scene.geometry) == 0:
-                    return True
-                
-                all_empty = True
-                for name, geom in scene.geometry.items():
-                    if hasattr(geom, 'vertices') and geom.vertices is not None and len(geom.vertices) > 0:
-                        all_empty = False
-                        break
-                if all_empty:
-                    return True
-            
-            if hasattr(scene, 'bounds'):
-                bounds = scene.bounds
-                if bounds is None or bounds.shape != (2, 3):
-                    return True
-                
-                diagonal = bounds[1] - bounds[0]
-                if np.allclose(diagonal, 0):
-                    return True
-            
-            if hasattr(scene, 'extents'):
-                if scene.extents is None or np.allclose(scene.extents, 0):
-                    return True
-            
-            return False
-            
-        except Exception as e:
-            print(f"Error checking if scene is empty: {e}")
+def is_scene_empty(scene):
+    """Check if a loaded scene/mesh is empty or invalid."""
+    try:
+        if scene is None:
             return True
+        
+        if hasattr(scene, 'is_empty') and scene.is_empty:
+            return True
+        
+        # Handle single Trimesh objects (no .geometry attribute)
+        if isinstance(scene, trimesh.Trimesh):
+            if scene.vertices is None or len(scene.vertices) == 0:
+                return True
+            if scene.faces is None or len(scene.faces) == 0:
+                return True
+            return False
+        
+        # Handle Scene objects
+        if hasattr(scene, 'geometry'):
+            if len(scene.geometry) == 0:
+                return True
+            
+            all_empty = True
+            for name, geom in scene.geometry.items():
+                if hasattr(geom, 'vertices') and geom.vertices is not None and len(geom.vertices) > 0:
+                    all_empty = False
+                    break
+            if all_empty:
+                return True
+        
+        # Fallback checks for bounds/extents
+        if hasattr(scene, 'bounds'):
+            bounds = scene.bounds
+            if bounds is None or bounds.shape != (2, 3):
+                return True
+            
+            diagonal = bounds[1] - bounds[0]
+            if np.allclose(diagonal, 0):
+                return True
+        
+        if hasattr(scene, 'extents'):
+            if scene.extents is None or np.allclose(scene.extents, 0):
+                return True
+        
+        return False
+        
+    except Exception as e:
+        print(f"Error checking if scene is empty: {e}")
+        return True
     
     def look_at(eye, target):
         """Safe version of look_at function with better error handling"""
@@ -473,7 +479,13 @@ def process_single_render(args):
         
         # Load scene
         scene = trimesh.load(absolute_file_path)
-        
+
+        # Convert single Trimesh to Scene for consistent handling
+        if isinstance(scene, trimesh.Trimesh):
+            mesh = scene
+            scene = trimesh.Scene()
+            scene.add_geometry(mesh)
+
         # Check if empty
         if is_scene_empty(scene):
             return 'empty', uid, None
@@ -639,6 +651,9 @@ def process_chunk(json_path, output_dir, chunk_id, total_chunks, scan_dir=None, 
         for uid, absolute_file_path in object_paths.items()
     ]
     
+    # Create lookup dictionary for efficient path retrieval
+    uid_to_path = {item[0]: item[1] for item in args_list}
+    
     del object_paths
     del all_object_paths
     gc.collect()
@@ -679,18 +694,18 @@ def process_chunk(json_path, output_dir, chunk_id, total_chunks, scan_dir=None, 
             elif status == 'empty':
                 empty_scenes += 1
                 # Delete empty scene file
-                original_path = [path for u, path in args_list if u == uid][0]
+                original_path = uid_to_path[uid]
                 if delete_bad_file_and_log(uid, original_path, "empty_scene", chunk_id):
                     deleted_files += 1
             elif status == 'incomplete':
                 errors += 1
-                original_path = [path for u, path in args_list if u == uid][0]
+                original_path = uid_to_path[uid]
                 if delete_bad_file_and_log(uid, original_path, "incomplete_renders", chunk_id):
                     deleted_files += 1
             elif status == 'error':
                 errors += 1
                 print(f"Error processing {uid}: {info}")
-                original_path = [path for u, path in args_list if u == uid][0]
+                original_path = uid_to_path[uid]
                 if delete_bad_file_and_log(uid, original_path, "render_error", chunk_id):
                     deleted_files += 1
         

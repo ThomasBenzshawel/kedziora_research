@@ -2,7 +2,7 @@
 #SBATCH --job-name=render_objaverse
 #SBATCH --output=logs/render_%A_%a.out
 #SBATCH --error=logs/render_%A_%a.err
-#SBATCH --array=0-12             
+#SBATCH --array=0-2             
 #SBATCH --ntasks=1               
 #SBATCH --cpus-per-task=6        # Increased from 4 to 6 for multiprocessing
 #SBATCH --mem=128G                
@@ -19,10 +19,6 @@ echo "Active conda environment: $CONDA_DEFAULT_ENV"
 which python
 python --version
 
-# Create directories
-mkdir -p logs
-mkdir -p "$OUTPUT_DIR"
-mkdir -p "$CHECK_DIR"
 
 # Set environment variables
 export CUDA_VISIBLE_DEVICES=$SLURM_LOCALID
@@ -35,10 +31,15 @@ export OPENBLAS_NUM_THREADS=1
 
 # Input paths
 JSON_PATH="/home/ad.msoe.edu/benzshawelt/.objaverse/hf-objaverse-v1/object-paths.json"
-SCAN_DIR="/home/ad.msoe.edu/benzshawelt/.objaverse"
-SCAN_DIR_2="/data/ur/kedziora/layer_x_layer/objaverse_xl"
+SCAN_DIR_2="/home/ad.msoe.edu/benzshawelt/.objaverse"
+SCAN_DIR="/data/ur/kedziora/layer_x_layer/objaverse_xl"
 OUTPUT_DIR="/data/ur/kedziora/layer_x_layer/objaverse_images"
 CHECK_DIR="/data/ur/kedziora/layer_x_layer/objaverse_images_check"
+
+# Create directories
+mkdir -p logs
+mkdir -p "$OUTPUT_DIR"
+mkdir -p "$CHECK_DIR"
 
 # Job parameters
 TOTAL_CHUNKS=$SLURM_ARRAY_TASK_COUNT

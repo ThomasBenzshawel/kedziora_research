@@ -46,7 +46,7 @@ from tqdm import tqdm
 import hashlib
 import sqlite3
 from tqdm import tqdm
-from train_encoder.encoder_training import ResidualBlock3D, LowResContextEncoder
+from layer_x_layer.training_from_scratch.train_encoder.train_low_res_encoder import ResidualBlock3D, LowResContextEncoder
 
 
 def initialize_model_weights(model):
@@ -101,7 +101,7 @@ def parse_args():
                         help='Override batch size (per GPU)')
     parser.add_argument('--learning_rate', type=float, default=None,
                         help='Override learning rate')
-    parser.add_argument('--validation_interval', type=int, default=10,
+    parser.add_argument('--validation_interval', type=int, default=1,
                         help='Run validation every N epochs')
     parser.add_argument('--checkpoint_interval', type=int, default=50,
                         help='Save checkpoint every N epochs')
@@ -117,6 +117,12 @@ def parse_args():
                         help='Number of epochs for each granularity stage (e.g., 500 250 200)')
     parser.add_argument('--parallel_training', type=bool, default=True,
                         help='Use parallel training for the noise prediction model')
+    parser.add_argument('--pretrained_encoder_path', type=str, default=None,
+                        help='Path to a pretrained encoder model')
+    parser.add_argument('--no_teacher_forcing', action='store_true',
+                        help='Disable teacher forcing during training')
+    parser.add_argument('--test_run', action='store_true',
+                        help='Run a quick test training loop')
 
     return parser.parse_args()
 
@@ -1241,9 +1247,6 @@ class MultiLayerCrossAttentionBlock(nn.Module):
         out = self.to_out(out)
         return x + out
 
-# ============================================================================
-# FACTORIZED CAUSAL ATTENTION - Layer Attention + Spatial Attention
-# ============================================================================
 class CausalLayerAttention(nn.Module):
     """
     Step 1 of factorized attention: Determine WHICH previous layers to attend to.
@@ -1460,7 +1463,7 @@ class FactorizedCausalAttention(nn.Module):
         
         Args:
             x_noisy: [B, L, C, H, W] - noisy layer features (queries)
-            x_clean: [B, L, C, H, W] - clean layer features (keys/values for teacher forcing)
+            x_clean: [B, L, C, H, W] - clean layer features (keys/values for teacher forcing) the "previous" layers
             
         Returns:
             output: [B, L, C, H, W] - attended features with residual connection
@@ -1567,6 +1570,8 @@ class FactorizedCausalAttentionParallel(nn.Module):
         
         self.dropout = nn.Dropout(dropout)
         self.output_scale = nn.Parameter(torch.tensor([0.1]))
+
+        self.minor_corruption_diffusion = ForwardDiffusion(timesteps=25, schedule='cosine')
         
     def compute_layer_weights(self, x_noisy, x_clean):
         """Compute causal layer attention weights."""
@@ -1644,8 +1649,35 @@ class FactorizedCausalAttentionParallel(nn.Module):
         out = out.permute(0, 1, 3, 2).contiguous().view(B_L, C, H, W)
         
         return self.spatial_out(out)
+
+
+    def create_noisy_context(self, x_clean):
+        """
+        Minimal version - just pass the precomputed schedules.
+        
+        Args:
+            x_clean: [B, L, C, H, W]
+            sqrt_alpha_hats: [T] tensor from diffusion
+            sqrt_one_minus_alpha_hats: [T] tensor from diffusion
+            max_t: Max timestep for corruption
+        """
+        B, L, C, H, W = x_clean.shape
+        device = x_clean.device
+        dtype = x_clean.dtype
+
+        sqrt_alpha_hats = self.minor_corruption_diffusion.sqrt_alpha_hats.to(device)
+        sqrt_one_minus_alpha_hats = self.minor_corruption_diffusion.sqrt_one_minus_alpha_hats.to(device)
+        max_t = self.minor_corruption_diffusion.timesteps
+
+        # Random timesteps + gather alphas + apply noise (all vectorized)
+        t = torch.randint(0, max_t, (B, L), device=device)
+        
+        sqrt_a = sqrt_alpha_hats[t].view(B, L, 1, 1, 1).to(dtype)
+        sqrt_1_minus_a = sqrt_one_minus_alpha_hats[t].view(B, L, 1, 1, 1).to(dtype)
+        
+        return sqrt_a * x_clean + sqrt_1_minus_a * torch.randn_like(x_clean)
     
-    def forward(self, x_noisy, x_clean):
+    def forward(self, x_noisy, x_clean, no_teacher_forcing=False):
         """
         Forward pass with factorized attention.
         
@@ -1656,6 +1688,12 @@ class FactorizedCausalAttentionParallel(nn.Module):
             [B, L, C, H, W]
         """
         B, L, C, H, W = x_noisy.shape
+
+        if no_teacher_forcing:
+            # Create noisy context on-the-fly
+            x_clean = self.create_noisy_context(
+                x_clean
+            )
         
         # Step 1: Layer attention
         layer_weights = self.compute_layer_weights(x_noisy, x_clean)  # [B, L, L]
@@ -1698,7 +1736,8 @@ class LayerXLayerDiffusionModelV4(nn.Module):
                  in_channels=1, model_channels=128, 
                  context_dim=512, attention_resolutions=[8, 16],
                  use_low_res_context=False, current_low_res_layer_context=False,
-                 factorized_attention_heads=8, spatial_attention_chunk=None):
+                 factorized_attention_heads=8, spatial_attention_chunk=None,
+                 no_teacher_forcing=False):
         super().__init__()
         self.granularity = granularity
         self.model_channels = model_channels
@@ -1707,6 +1746,7 @@ class LayerXLayerDiffusionModelV4(nn.Module):
         self.max_context_layers = max_context_layers
         self.use_low_res_context = use_low_res_context
         self.current_low_res_layer_context = current_low_res_layer_context
+        self.no_teacher_forcing = no_teacher_forcing
         
         # Layer positional embeddings
         self.layer_pos_emb = SinusoidalPosEmb(layer_context_dim)
@@ -1864,7 +1904,8 @@ class LayerXLayerDiffusionModelV4(nn.Module):
             all_layers_clean = torch.cat([prev_encoded, h_expanded], dim=1)  # Using same for inference
             
             # Apply factorized attention
-            all_layers_attended = self.factorized_layer_attn(all_layers_noisy, all_layers_clean)
+            all_layers_attended = self.factorized_layer_attn(all_layers_noisy, all_layers_clean, 
+                                                             no_teacher_forcing=self.no_teacher_forcing)
             
             # Extract the current layer
             h = all_layers_attended[:, -1]  # [B, C, H, W]
@@ -1931,7 +1972,7 @@ class LayerXLayerDiffusionModelV4(nn.Module):
         h_clean = h_clean.reshape(B, L, self.model_channels, H, W)
         
         # ========== Factorized Causal Attention ==========
-        h = self.factorized_layer_attn(h_noisy, h_clean)  # [B, L, model_channels, H, W]
+        h = self.factorized_layer_attn(h_noisy, h_clean, no_teacher_forcing=self.no_teacher_forcing)  # [B, L, model_channels, H, W]
         
         # Low-res conditioning (if available)
         if low_res_features is not None and self.use_low_res_context:
@@ -1977,14 +2018,14 @@ class LayerXLayerDiffusionTrainerV4:
     Unified trainer supporting both parallel (LLM-style) and sequential training.
     """
     def __init__(self, model: LayerXLayerDiffusionModelV4, diffusion, use_scheduler=False, 
-                 teacher_forcing=True, use_ddim=True, ddim_steps=50, ddim_eta=0.0, 
+                 no_teacher_forcing=False, use_ddim=True, ddim_steps=50, ddim_eta=0.0, 
                  low_res_contexts=None, parallel_training=True):
         """
         Args:
             model: LayerXLayerDiffusionModelV4 instance
             diffusion: ForwardDiffusion instance
             use_scheduler: Whether to use a learning rate scheduler
-            teacher_forcing: Use ground truth layers vs predicted layers (for sequential)
+            no_teacher_forcing: Use ground truth layers vs predicted layers (for sequential)
             use_ddim: Use DDIM sampling
             ddim_steps: Number of steps for DDIM sampling
             ddim_eta: Stochasticity parameter for DDIM
@@ -2010,7 +2051,7 @@ class LayerXLayerDiffusionTrainerV4:
         self.ddim_eta = ddim_eta
         self.low_res_contexts = low_res_contexts or {}
         self.parallel_training = parallel_training
-        self.teacher_forcing = teacher_forcing
+        self.no_teacher_forcing = no_teacher_forcing
         if args.use_ddp and args.mixed_precision:
             self.scaler = GradScaler('cuda')
 
@@ -2196,7 +2237,7 @@ class LayerXLayerDiffusionTrainerV4:
                 total_loss += loss.item()
             
             # Add to history
-            if self.teacher_forcing:
+            if not self.no_teacher_forcing:
                 prev_layers_list.append(current_layer.detach())
             else:
                 # Use model's prediction (more realistic but harder to train)
@@ -2464,6 +2505,8 @@ class FSDPProgressiveGranularityTrainer:
         )
 
         self.plots_dir = Path('./training_plots')
+
+        # Create plots directory if it doesn't exist
         self.plots_dir.mkdir(parents=True, exist_ok=True)
 
 
@@ -2588,7 +2631,7 @@ class FSDPProgressiveGranularityTrainer:
         except Exception as e:
             print_main(f"⚠ Error plotting loss curves: {e}")
         
-    def train_all_stages(self, epochs_per_stage, device, embedding_cache):
+    def train_all_stages(self, epochs_per_stage, device, embedding_cache, test_run=False):
         """Train all granularity stages sequentially and return metrics"""
         print_main("\n" + "="*60)
         print_main("PROGRESSIVE GRANULARITY TRAINING")
@@ -2601,6 +2644,8 @@ class FSDPProgressiveGranularityTrainer:
         for stage_idx in range(len(self.granularities)):
             granularity = self.granularities[stage_idx]
             epochs = epochs_per_stage[stage_idx]
+
+            data_size = 0 if not test_run else 20
             
             # Create datasets for this granularity
             print_main(f"\nCreating datasets for {granularity}³ resolution...")
@@ -2608,15 +2653,18 @@ class FSDPProgressiveGranularityTrainer:
                 npy_folder_path=f'/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_voxels/{granularity}',
                 description_folder_path='/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_descriptions',
                 granularity=granularity,
-                test_count=400,  # Adjust as needed
+                test_count=data_size,  # Adjust as needed
                 enable_fuzzy_matching=args.enable_fuzzy_matching
             )
-            
+
+            # npy_folder_path=f'/data/ur/kedziora/layer_x_layer/voxels/{granularity}',
+            # description_folder_path='/data/ur/kedziora/layer_x_layer/objaverse_descriptions',
+
             stage_val_dataset = VoxelDataset(
                 npy_folder_path=f'/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_voxels/{granularity}',
                 description_folder_path='/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_descriptions',
                 granularity=granularity,
-                test_count=400,  # Use 400 samples for validation
+                test_count=1000,  # Use 1000 samples for validation
                 enable_fuzzy_matching=args.enable_fuzzy_matching
             )
             
@@ -2671,7 +2719,10 @@ class FSDPProgressiveGranularityTrainer:
             with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
                 if rank == 0:
                     state_dict = model.state_dict()
-                    checkpoint_path = f'stage{stage_idx}_gran{granularity}.pth'
+                    # make a models dir
+                    os.makedirs("models", exist_ok=True)
+
+                    checkpoint_path = f'models/stage{stage_idx}_gran{granularity}.pth'
                     torch.save({
                         'model_state_dict': state_dict,
                         'granularity': granularity,
@@ -2683,7 +2734,8 @@ class FSDPProgressiveGranularityTrainer:
         elif args.use_ddp:
             # DDP saving - only rank 0, unwrap model
             if rank == 0:
-                checkpoint_path = f'stage{stage_idx}_gran{granularity}.pth'
+                os.makedirs("models", exist_ok=True)
+                checkpoint_path = f'models/stage{stage_idx}_gran{granularity}.pth'
                 # Get unwrapped model state dict
                 unwrapped_model = model.module if hasattr(model, 'module') else model
                 torch.save({
@@ -2738,6 +2790,7 @@ class FSDPProgressiveGranularityTrainer:
             current_low_res_layer_context=args.current_layer_only,
             factorized_attention_heads=8,
             spatial_attention_chunk=64 if prev_granularity >= 64 else None,
+            no_teacher_forcing=args.no_teacher_forcing,
         ).to(device)
         
         # Load checkpoint
@@ -3026,6 +3079,7 @@ class FSDPProgressiveGranularityTrainer:
             current_low_res_layer_context=args.current_layer_only,
             factorized_attention_heads=8,
             spatial_attention_chunk=64 if granularity >= 64 else None,  # Chunk for memory on large grids
+            no_teacher_forcing=args.no_teacher_forcing,
         )
         model = initialize_model_weights(model)
 
@@ -3077,6 +3131,7 @@ class FSDPProgressiveGranularityTrainer:
             use_ddim=True,
             ddim_steps=50,
             parallel_training=args.parallel_training,
+            no_teacher_forcing=args.no_teacher_forcing,
         )
         
         # Create dataloaders
@@ -3151,16 +3206,21 @@ class FSDPProgressiveGranularityTrainer:
                 # Generate visualizations (only rank 0)
                 if rank == 0:
                     print_main("\nGenerating validation visualizations...")
-                    
-                    sample_descriptions = [
-                        "A wooden chair legs",
-                        "A simple ceramic mug",
-                        "A basketball",
-                        "A house on a flat surface"
-                    ][:4]
 
                     t5_tokenizer = T5Tokenizer.from_pretrained('t5-base')
                     t5_model = T5EncoderModel.from_pretrained('t5-base').to(device)
+
+                    # Sample some descriptions from the val dataset
+                    sample_descriptions = []
+                    for i in range(4):
+                        idx = random.randint(0, len(val_dataset) - 1)
+                        _, desc, _ = val_dataset[idx]
+                        sample_descriptions.append(desc)
+
+                    sample_descriptions += [
+                        "A wooden chair with 4 legs",
+                        "A ceramic vase",
+                    ]
                     
                     try:
                         self.visualizer.visualize_epoch_samples(
@@ -3200,6 +3260,10 @@ class FSDPProgressiveGranularityTrainer:
         stage_metrics['best_val_loss'] = best_val_loss
         self.metrics_history['stages'][stage_idx] = stage_metrics
         
+        # barier
+        if is_distributed:
+            dist.barrier()
+
         # Save checkpoint for next stage
         self.save_stage_checkpoint(model, stage_idx, device)
         
@@ -3335,6 +3399,7 @@ class TrainingVoxelVisualizer:
         """
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
+
         self.max_voxels = max_voxels
     
     def visualize_single_voxel(self, voxel_grid, ax, threshold=0.5, view_angle=(30, 45), colormap='viridis'):
@@ -3715,7 +3780,7 @@ def create_distributed_dataloaders(train_dataset, val_dataset, batch_size):
         shuffle=shuffle_train if train_sampler is None else False,
         num_workers=num_workers,  # Fixed
         pin_memory=True,
-        prefetch_factor=2,  # Reduced from 4
+        prefetch_factor=2,  
         drop_last=True,
         persistent_workers=True if num_workers > 0 else False,
         collate_fn=collate_fn
@@ -3841,7 +3906,8 @@ progressive_trainer = FSDPProgressiveGranularityTrainer(
 results = progressive_trainer.train_all_stages(
     epochs_per_stage=epochs_per_stage,  # Epochs for 16³, 32³, 64³
     device=device,
-    embedding_cache=embedding_cache
+    embedding_cache=embedding_cache,
+    test_run=args.test_run
 )
 
 # Extract results
@@ -4037,4 +4103,4 @@ if rank == 0:  # Only rank 0 creates visualizations
 # Cleanup
 if is_distributed:
     dist.destroy_process_group()
-torch.cuda.empty_cache()
+    torch.cuda.empty_cache()

@@ -5,10 +5,9 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=256G
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:1
 #SBATCH --partition=dgxh100
 #SBATCH --account=undergrad_research
-#SBATCH --time=96:00:00
 
 # train_encoder_progressive.sbatch
 # This script trains encoders for ALL resolution pairs in your progressive pipeline
@@ -37,7 +36,7 @@ python3 --version
 echo ""
 
 # Set environment variables
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((SLURM_GPUS_ON_NODE - 1)))
 export NCCL_DEBUG=INFO
 export NCCL_IB_DISABLE=0  # Enable InfiniBand for H100
 export PYTHONUNBUFFERED=1
@@ -56,6 +55,7 @@ NUM_GPUS=${SLURM_GPUS_ON_NODE:-4}
 RESOLUTION_PAIRS=(
     "16:32"
     "32:64"
+    "64:128"
 )
 
 # Training parameters
@@ -140,8 +140,6 @@ for pair in "${RESOLUTION_PAIRS[@]}"; do
             --val_split 0.1 \
             --encoder_mode ${ENCODER_MODE} \
             --base_channels ${BASE_CHANNELS} \
-            --use_fsdp \
-            --mixed_precision \
             --output_dir "${OUTPUT_DIR}" \
             --checkpoint_interval 5
     

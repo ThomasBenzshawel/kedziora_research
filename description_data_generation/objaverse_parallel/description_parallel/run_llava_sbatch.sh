@@ -9,14 +9,14 @@
 #SBATCH --mem=128G
 #SBATCH --gres=gpu:1
 #SBATCH --partition=dgxh100
-#SBATCH --array=0-6%7  # Run 7 workers in parallel (adjust as needed)
+#SBATCH --array=0-2%3  # Run 3 workers in parallel (adjust as needed)
 #SBATCH --account=undergrad_research
 
 
 # ============================================
 # Configuration
 # ============================================
-TOTAL_WORKERS=7
+TOTAL_WORKERS=3
 FILE_LIST="../voxelize_parallel/logs/glb_file_list.json"
 IMAGES_BASE_DIR="/data/ur/kedziora/layer_x_layer/objaverse_images"
 OUTPUT_DIR="/data/ur/kedziora/layer_x_layer/objaverse_descriptions"
@@ -55,12 +55,8 @@ echo "=========================================="
 # ============================================
 # Initialize conda
 source ~/.bashrc
-source /usr/local/miniforge3/etc/profile.d/conda.sh
-
 eval "$(conda shell.bash hook)"
-
-# Activate conda environment  
-conda activate llava
+conda activate /home/ad.msoe.edu/benzshawelt/.conda/envs/llava
 
 echo "Worker $WORKER_ID: Activated conda environment 'llava'"
 echo "Python path: $(which python3)"

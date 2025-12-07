@@ -393,9 +393,7 @@ def train_epoch(encoder, decoder, dataloader, optimizer, device, epoch, rank, wo
     total_occupancy_diff = 0
     num_batches = 0
     
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=(rank != 0))
-    
-    for batch_idx, (low_res, high_res, stems) in enumerate(pbar):
+    for batch_idx, (low_res, high_res, stems) in enumerate(dataloader):
         low_res = low_res.to(device)
         high_res = high_res.to(device)
         
@@ -434,13 +432,6 @@ def train_epoch(encoder, decoder, dataloader, optimizer, device, epoch, rank, wo
         total_mse += mse_loss.item()
         total_occupancy_diff += abs(pred_occupancy.item() - true_occupancy.item())
         num_batches += 1
-        
-        if rank == 0:
-            pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'mse': f'{mse_loss.item():.4f}',
-                'occ_diff': f'{abs(pred_occupancy.item() - true_occupancy.item()):.4f}'
-            })
     
     # Synchronize metrics across ranks
     if world_size > 1:
@@ -648,7 +639,10 @@ def main():
     
     best_val_loss = float('inf')
     
-    for epoch in range(1, args.epochs + 1):
+    # Create epoch-level progress bar (only on rank 0)
+    epoch_pbar = tqdm(range(1, args.epochs + 1), desc="Training", disable=(rank != 0))
+    
+    for epoch in epoch_pbar:
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         
@@ -665,12 +659,14 @@ def main():
         
         scheduler.step()
         
+        # Update progress bar with metrics
         if rank == 0:
-            print(f"\nEpoch {epoch}/{args.epochs}")
-            print(f"  Train Loss: {train_metrics['loss']:.4f}")
-            print(f"  Train MSE:  {train_metrics['mse']:.4f}")
-            print(f"  Val Loss:   {val_metrics['val_loss']:.4f}")
-            print(f"  Val MSE:    {val_metrics['val_mse']:.4f}")
+            epoch_pbar.set_postfix({
+                'loss': f'{train_metrics["loss"]:.4f}',
+                'mse': f'{train_metrics["mse"]:.4f}',
+                'val_loss': f'{val_metrics["val_loss"]:.4f}',
+                'val_mse': f'{val_metrics["val_mse"]:.4f}'
+            })
             
             # Save metrics
             metrics_history['train_loss'].append(train_metrics['loss'])
@@ -696,7 +692,7 @@ def main():
                 best_path, rank, args.use_fsdp
             )
             if rank == 0:
-                print(f"  ✓ New best model! Val Loss: {best_val_loss:.4f}")
+                tqdm.write(f"  ✓ New best model! Val Loss: {best_val_loss:.4f}")
         
         if is_distributed:
             dist.barrier()
