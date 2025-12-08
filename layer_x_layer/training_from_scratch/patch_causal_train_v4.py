@@ -2844,7 +2844,7 @@ class FSDPProgressiveGranularityTrainer:
             print_main(f"✓ Loading existing cache from {cache_path}")
             low_res_contexts = torch.load(cache_path, map_location='cpu')
             print_main(f"✓ Loaded {len(low_res_contexts)} cached contexts")
-            
+
             # check if the number of cached contexts matches the dataset size
             if len(low_res_contexts) == len(dataset):
                 print_main(f"✓ Loaded {len(low_res_contexts)} cached contexts")
@@ -3119,13 +3119,15 @@ class FSDPProgressiveGranularityTrainer:
 
         # Load previous stage model weights if available
         if stage_idx > 0 and stage_idx - 1:
-            if Path('encoder_checkpoints_stage{}_to_stage{}.pth'.format(stage_list[stage_idx - 1], stage_list[stage_idx])).exists():
-                prev_checkpoint_path = 'encoder_checkpoints_stage{}_to_stage{}.pth'.format(stage_list[stage_idx - 1], stage_list[stage_idx])
-                print_main(f"Loading encoder weights from {prev_checkpoint_path}...")
+            encoder_path =Path('./train_encoder/encoder_checkpoints_stage{}_to_stage{}/best_encoder.pth'.format(stage_list[stage_idx - 1], stage_list[stage_idx]))
+            if encoder_path.exists():
+                print_main(f"Loading encoder weights from {encoder_path}...")
                 model = load_pretrained_encoder(
                     model, 
-                    prev_checkpoint_path,
+                    encoder_path,
                 )
+            else:
+                print_main(f"No encoder checkpoint found at {encoder_path}, proceeding without loading encoder weights, meaning the model will output RANDOM voxels ALL the time!")
 
         # Convert to target dtype
         model = model.to(dtype=MASTER_DTYPE).to(device)
