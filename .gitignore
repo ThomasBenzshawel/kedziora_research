@@ -68,3 +68,6 @@ layer_x_layer/training_from_scratch/t5_cache/embeddings.db
 *.pkl
 *.zip
 build/
+*.db-shm
+*.db-wal
+layer_x_layer/training_from_scratch/t5_cache/embeddings.db-wal

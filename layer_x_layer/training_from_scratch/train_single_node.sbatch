@@ -135,7 +135,7 @@ CHECKPOINT_INTERVAL=50
 
 # FSDP configuration
 SHARDING_STRATEGY="FULL_SHARD"  # Options: FULL_SHARD, SHARD_GRAD_OP, NO_SHARD
-USE_CPU_OFFLOAD="false"         # Set to "true" if running out of memory
+USE_CPU_OFFLOAD="true"         # Set to "true" if running out of memory
 
 
 echo "=========================================="
@@ -167,6 +167,7 @@ CMD="torchrun \
     --batch_size $BATCH_SIZE \
     --validation_interval $VALIDATION_INTERVAL \
     --checkpoint_interval $CHECKPOINT_INTERVAL \
+    --skip_cache_scan \
     --test_run \
     --no_teacher_forcing
     "
