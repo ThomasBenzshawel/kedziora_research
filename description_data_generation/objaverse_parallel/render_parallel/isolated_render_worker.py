@@ -137,13 +137,25 @@ def update_bad_item_deletion_status(uid, deleted_successfully):
                 return
 
 
-def delete_bad_file_and_log(uid, file_path, reason, worker_id):
+def log_bad_item(uid, file_path, reason, worker_id):
+    """
+    Log a bad item without deleting it.
+    """
+    return add_to_bad_items_list(uid, file_path, reason, worker_id)
+
+
+def delete_bad_file_and_log(uid, file_path, reason, worker_id, do_cleanup=True):
     """
     Delete a bad 3D model file and add it to the bad items list.
+    If do_cleanup is False, only log the item without deleting.
     """
     if not add_to_bad_items_list(uid, file_path, reason, worker_id):
         print(f"Failed to log bad item to list: {uid}")
         return False
+    
+    if not do_cleanup:
+        print(f"Logged bad file (no deletion): {file_path} (Reason: {reason})")
+        return True
     
     deleted_successfully = False
     if os.path.exists(file_path):
@@ -248,9 +260,10 @@ def load_object_paths(json_path, scan_directories=None, use_folder_name_as_uid=T
     return all_object_paths
 
 
-def cleanup_incomplete_renders(output_dir, all_object_paths, worker_id):
+def cleanup_incomplete_renders(output_dir, all_object_paths, worker_id, do_cleanup=True):
     """
     Check previously rendered objects and delete originals with incomplete renders.
+    If do_cleanup is False, only log but don't delete.
     """
     if not os.path.exists(output_dir):
         print("Output directory doesn't exist, skipping cleanup")
@@ -275,21 +288,22 @@ def cleanup_incomplete_renders(output_dir, all_object_paths, worker_id):
             if uid in all_object_paths:
                 original_file_path = all_object_paths[uid]
                 if os.path.exists(original_file_path):
-                    print(f"Cleanup: Found incomplete renders for {uid}, deleting original file")
-                    if delete_bad_file_and_log(uid, original_file_path, "incomplete_renders_cleanup", worker_id):
+                    print(f"Cleanup: Found incomplete renders for {uid}, {'deleting' if do_cleanup else 'logging'} original file")
+                    if delete_bad_file_and_log(uid, original_file_path, "incomplete_renders_cleanup", worker_id, do_cleanup):
                         deleted_count += 1
                 else:
                     print(f"Cleanup: Original file already deleted for {uid}")
             else:
                 print(f"Cleanup: Could not find original file path for {uid} (not in current batch)")
             
-            try:
-                shutil.rmtree(output_dir_path)
-                print(f"Cleanup: Removed incomplete output directory for {uid}")
-            except Exception as e:
-                print(f"Cleanup: Error removing output directory {output_dir_path}: {e}")
+            if do_cleanup:
+                try:
+                    shutil.rmtree(output_dir_path)
+                    print(f"Cleanup: Removed incomplete output directory for {uid}")
+                except Exception as e:
+                    print(f"Cleanup: Error removing output directory {output_dir_path}: {e}")
     
-    print(f"Cleanup completed: {deleted_count} files deleted")
+    print(f"Cleanup completed: {deleted_count} files {'deleted' if do_cleanup else 'logged'}")
     return deleted_count
 
 
@@ -308,55 +322,55 @@ def process_single_render(args):
     import cv2
     import gc
     
-def is_scene_empty(scene):
-    """Check if a loaded scene/mesh is empty or invalid."""
-    try:
-        if scene is None:
-            return True
-        
-        if hasattr(scene, 'is_empty') and scene.is_empty:
-            return True
-        
-        # Handle single Trimesh objects (no .geometry attribute)
-        if isinstance(scene, trimesh.Trimesh):
-            if scene.vertices is None or len(scene.vertices) == 0:
+    def is_scene_empty(scene):
+        """Check if a loaded scene/mesh is empty or invalid."""
+        try:
+            if scene is None:
                 return True
-            if scene.faces is None or len(scene.faces) == 0:
+            
+            if hasattr(scene, 'is_empty') and scene.is_empty:
                 return True
+            
+            # Handle single Trimesh objects (no .geometry attribute)
+            if isinstance(scene, trimesh.Trimesh):
+                if scene.vertices is None or len(scene.vertices) == 0:
+                    return True
+                if scene.faces is None or len(scene.faces) == 0:
+                    return True
+                return False
+            
+            # Handle Scene objects
+            if hasattr(scene, 'geometry'):
+                if len(scene.geometry) == 0:
+                    return True
+                
+                all_empty = True
+                for name, geom in scene.geometry.items():
+                    if hasattr(geom, 'vertices') and geom.vertices is not None and len(geom.vertices) > 0:
+                        all_empty = False
+                        break
+                if all_empty:
+                    return True
+            
+            # Fallback checks for bounds/extents
+            if hasattr(scene, 'bounds'):
+                bounds = scene.bounds
+                if bounds is None or bounds.shape != (2, 3):
+                    return True
+                
+                diagonal = bounds[1] - bounds[0]
+                if np.allclose(diagonal, 0):
+                    return True
+            
+            if hasattr(scene, 'extents'):
+                if scene.extents is None or np.allclose(scene.extents, 0):
+                    return True
+            
             return False
-        
-        # Handle Scene objects
-        if hasattr(scene, 'geometry'):
-            if len(scene.geometry) == 0:
-                return True
             
-            all_empty = True
-            for name, geom in scene.geometry.items():
-                if hasattr(geom, 'vertices') and geom.vertices is not None and len(geom.vertices) > 0:
-                    all_empty = False
-                    break
-            if all_empty:
-                return True
-        
-        # Fallback checks for bounds/extents
-        if hasattr(scene, 'bounds'):
-            bounds = scene.bounds
-            if bounds is None or bounds.shape != (2, 3):
-                return True
-            
-            diagonal = bounds[1] - bounds[0]
-            if np.allclose(diagonal, 0):
-                return True
-        
-        if hasattr(scene, 'extents'):
-            if scene.extents is None or np.allclose(scene.extents, 0):
-                return True
-        
-        return False
-        
-    except Exception as e:
-        print(f"Error checking if scene is empty: {e}")
-        return True
+        except Exception as e:
+            print(f"Error checking if scene is empty: {e}")
+            return True
     
     def look_at(eye, target):
         """Safe version of look_at function with better error handling"""
@@ -607,7 +621,7 @@ def get_work_chunk(object_paths, chunk_id, total_chunks):
 
 
 def process_chunk(json_path, output_dir, chunk_id, total_chunks, scan_dir=None, scan_dir_2=None,
-                 use_folder_name_as_uid=True, log_file=None, check_dir=None):
+                 use_folder_name_as_uid=True, log_file=None, check_dir=None, do_cleanup=True):
     """Process a chunk of the 3D dataset with process isolation"""
     
     # Set up logging
@@ -618,6 +632,7 @@ def process_chunk(json_path, output_dir, chunk_id, total_chunks, scan_dir=None, 
     print(f"Worker {chunk_id}/{total_chunks} starting...")
     print(f"GPU: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Unknown')}")
     print(f"Process isolation: Enabled (batch size: 25)")
+    print(f"Cleanup mode: {'Enabled (will delete bad files)' if do_cleanup else 'Disabled (will only log bad files)'}")
     
     # Prepare directories to scan
     scan_directories = []
@@ -637,7 +652,7 @@ def process_chunk(json_path, output_dir, chunk_id, total_chunks, scan_dir=None, 
     # Only worker 0 performs cleanup
     cleanup_deleted = 0
     if chunk_id == 0:
-        cleanup_deleted = cleanup_incomplete_renders(output_dir, all_object_paths, chunk_id)
+        cleanup_deleted = cleanup_incomplete_renders(output_dir, all_object_paths, chunk_id, do_cleanup)
     
     # Get this worker's chunk
     object_paths = get_work_chunk(all_object_paths, chunk_id, total_chunks)
@@ -671,7 +686,6 @@ def process_chunk(json_path, output_dir, chunk_id, total_chunks, scan_dir=None, 
     
     print(f"Processing {len(args_list)} files in {total_batches} batches of up to {batch_size} files each")
     
-    import time
     start_time = time.time()
     
     for batch_idx in range(total_batches):
@@ -686,7 +700,15 @@ def process_chunk(json_path, output_dir, chunk_id, total_chunks, scan_dir=None, 
             results = pool.map(process_single_render, batch)
         
         # Process results
-        for status, uid, info in results:
+        for result in results:
+            # Handle None results (shouldn't happen now, but defensive)
+            if result is None:
+                errors += 1
+                print(f"Warning: Got None result from process_single_render")
+                continue
+            
+            status, uid, info = result
+            
             if status == 'success':
                 processed += 1
             elif status == 'skipped':
@@ -694,19 +716,19 @@ def process_chunk(json_path, output_dir, chunk_id, total_chunks, scan_dir=None, 
             elif status == 'empty':
                 empty_scenes += 1
                 # Delete empty scene file
-                original_path = uid_to_path[uid]
-                if delete_bad_file_and_log(uid, original_path, "empty_scene", chunk_id):
+                original_path = uid_to_path.get(uid)
+                if original_path and delete_bad_file_and_log(uid, original_path, "empty_scene", chunk_id, do_cleanup):
                     deleted_files += 1
             elif status == 'incomplete':
                 errors += 1
-                original_path = uid_to_path[uid]
-                if delete_bad_file_and_log(uid, original_path, "incomplete_renders", chunk_id):
+                original_path = uid_to_path.get(uid)
+                if original_path and delete_bad_file_and_log(uid, original_path, "incomplete_renders", chunk_id, do_cleanup):
                     deleted_files += 1
             elif status == 'error':
                 errors += 1
                 print(f"Error processing {uid}: {info}")
-                original_path = uid_to_path[uid]
-                if delete_bad_file_and_log(uid, original_path, "render_error", chunk_id):
+                original_path = uid_to_path.get(uid)
+                if original_path and delete_bad_file_and_log(uid, original_path, "render_error", chunk_id, do_cleanup):
                     deleted_files += 1
         
         # Progress logging
@@ -724,9 +746,10 @@ def process_chunk(json_path, output_dir, chunk_id, total_chunks, scan_dir=None, 
     
     elapsed_time = time.time() - start_time
     print(f"Worker {chunk_id} completed in {elapsed_time/60:.2f} minutes")
-    print(f"Processed: {processed}, Skipped: {skipped}, Errors: {errors}, Empty scenes: {empty_scenes}, Deleted: {deleted_files}")
+    print(f"Processed: {processed}, Skipped: {skipped}, Errors: {errors}, Empty scenes: {empty_scenes}, "
+          f"{'Deleted' if do_cleanup else 'Logged'}: {deleted_files}")
     if chunk_id == 0 and cleanup_deleted > 0:
-        print(f"Cleanup: {cleanup_deleted} incomplete renders cleaned up")
+        print(f"Cleanup: {cleanup_deleted} incomplete renders {'cleaned up' if do_cleanup else 'logged'}")
     
     # Write completion status
     status_file = os.path.join(output_dir, f"worker_{chunk_id}_status.txt")
@@ -738,6 +761,7 @@ def process_chunk(json_path, output_dir, chunk_id, total_chunks, scan_dir=None, 
         f.write(f"cleanup_deleted: {cleanup_deleted}\n")
         f.write(f"skipped: {skipped}\n")
         f.write(f"total_assigned: {len(args_list)}\n")
+        f.write(f"cleanup_enabled: {do_cleanup}\n")
 
 
 def main():
@@ -753,6 +777,8 @@ def main():
     parser.add_argument('--log_file', help='Log file path')
     parser.add_argument('--check_dir', help='Directory to put problematic files', 
                        default="../check_objaverse_images/")
+    parser.add_argument('--cleanup', action='store_true', default=False,
+                       help='Enable cleanup mode: delete bad/empty/failed files. Without this flag, bad files are only logged.')
 
     args = parser.parse_args()
     
@@ -762,7 +788,8 @@ def main():
     
     process_chunk(args.json_path, args.output_dir, args.chunk_id, 
                  args.total_chunks, args.scan_dir, args.scan_dir_2, 
-                 args.use_folder_name_as_uid, args.log_file, args.check_dir)
+                 args.use_folder_name_as_uid, args.log_file, args.check_dir,
+                 args.cleanup)
 
 
 if __name__ == "__main__":

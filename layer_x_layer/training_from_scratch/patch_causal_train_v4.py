@@ -22,6 +22,8 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.amp import autocast, GradScaler
+from torch.utils.data import random_split
+
 
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
@@ -46,7 +48,7 @@ from tqdm import tqdm
 import hashlib
 import sqlite3
 from tqdm import tqdm
-from layer_x_layer.training_from_scratch.train_encoder.train_low_res_encoder import ResidualBlock3D, LowResContextEncoder
+from train_encoder.train_low_res_encoder import ResidualBlock3D, LowResContextEncoder
 
 
 def initialize_model_weights(model):
@@ -2144,6 +2146,12 @@ class LayerXLayerDiffusionTrainerV4:
                     low_res_context.to(model_dtype), L
                 ).detach()
         
+        if low_res_features is not None:
+            print(f"[DEBUG rank {dist.get_rank() if dist.is_initialized() else 0}]")
+            print(f"  x_noisy_all.shape = {x_noisy.shape}")  # Should be [B, L, C, H, W]
+            print(f"  low_res_features.shape = {low_res_features.shape}")  # Should be [B, L, 128]
+            print(f"  Batch sizes match: {x_noisy.shape[0] == low_res_features.shape[0]}")
+            
         predicted_noise = model(
             x_noisy, t_all, context.to(model_dtype), all_layers,
             low_res_features=low_res_features
@@ -2649,30 +2657,31 @@ class FSDPProgressiveGranularityTrainer:
             
             # Create datasets for this granularity
             print_main(f"\nCreating datasets for {granularity}³ resolution...")
-            stage_train_dataset = VoxelDataset(
+
+            # Create one dataset with all the data you want
+            full_dataset = VoxelDataset(
                 npy_folder_path=f'/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_voxels/{granularity}',
                 description_folder_path='/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_descriptions',
                 granularity=granularity,
-                test_count=data_size,  # Adjust as needed
+                test_count=data_size + 1000,  # Total samples needed (train + val)
                 enable_fuzzy_matching=args.enable_fuzzy_matching
             )
 
-            # npy_folder_path=f'/data/ur/kedziora/layer_x_layer/voxels/{granularity}',
-            # description_folder_path='/data/ur/kedziora/layer_x_layer/objaverse_descriptions',
-
-            stage_val_dataset = VoxelDataset(
-                npy_folder_path=f'/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_voxels/{granularity}',
-                description_folder_path='/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_descriptions',
-                granularity=granularity,
-                test_count=1000,  # Use 1000 samples for validation
-                enable_fuzzy_matching=args.enable_fuzzy_matching
+            # Split into train and validation
+            train_size = len(full_dataset) - 1000  # Use all but 1000 for training
+            val_size = 1000
+            stage_train_dataset, stage_val_dataset = random_split(
+                full_dataset, 
+                [train_size, val_size],
+                generator=torch.Generator().manual_seed(42)  # For reproducibility
             )
-            
-            # Train this stage
+
+            # Train this stage - NOW PASSING full_dataset for context precomputation
             stage_metrics = self.train_stage(
                 stage_idx=stage_idx,
                 train_dataset=stage_train_dataset,
                 val_dataset=stage_val_dataset,
+                full_dataset=full_dataset,  # ADD THIS
                 epochs=epochs,
                 device=device,
                 embedding_cache=embedding_cache,
@@ -2810,12 +2819,19 @@ class FSDPProgressiveGranularityTrainer:
 
         return prev_model
         
-    def precompute_low_res_contexts(self, stage_idx, train_dataset, device, 
+    def precompute_low_res_contexts(self, stage_idx, dataset, device, 
                                 embedding_cache, batch_size=4):
         """
         Precompute all low-res contexts before training starts.
         Handles recursive context loading (stage 2 needs stage 1 contexts, 
         which were generated with stage 0 contexts).
+        
+        Args:
+            stage_idx: Current stage index
+            dataset: Full VoxelDataset or Subset containing all samples needing contexts
+            device: Device to run on
+            embedding_cache: T5 embedding cache
+            batch_size: Batch size for generation
         """
         if stage_idx == 0:
             return {}
@@ -2828,7 +2844,13 @@ class FSDPProgressiveGranularityTrainer:
             print_main(f"✓ Loading existing cache from {cache_path}")
             low_res_contexts = torch.load(cache_path, map_location='cpu')
             print_main(f"✓ Loaded {len(low_res_contexts)} cached contexts")
-            return low_res_contexts
+            
+            # check if the number of cached contexts matches the dataset size
+            if len(low_res_contexts) == len(dataset):
+                print_main(f"✓ Loaded {len(low_res_contexts)} cached contexts")
+                return low_res_contexts
+            else:
+                print_main(f"⚠ Cache size {len(low_res_contexts)} does not match dataset size {len(dataset)}. Regenerating contexts...")
         
         # Load previous stage model on GPU
         prev_model = self.load_prev_stage_model_gpu(stage_idx, device)
@@ -2847,8 +2869,21 @@ class FSDPProgressiveGranularityTrainer:
         prev_granularity = self.granularities[stage_idx - 1]
         
         if rank == 0:
+            # Handle both VoxelDataset and Subset
+            if hasattr(dataset, 'file_list'):
+                # It's a VoxelDataset
+                file_list = dataset.file_list
+            elif hasattr(dataset, 'dataset'):
+                # It's a Subset - get file_list from underlying dataset
+                underlying_dataset = dataset.dataset
+                # Get the indices that are part of this subset
+                indices = dataset.indices
+                file_list = [underlying_dataset.file_list[i] for i in indices]
+            else:
+                raise ValueError(f"Unknown dataset type: {type(dataset)}")
+            
             curr_stems = set()
-            for file_path in train_dataset.file_list:
+            for file_path in file_list:
                 curr_stems.add(file_path.stem)
             
             # Create dataset for previous granularity
@@ -2957,7 +2992,6 @@ class FSDPProgressiveGranularityTrainer:
             low_res_contexts = self._load_context_cache(stage_idx)
         
         return low_res_contexts
-    
     def _sample_gpu(self, model, context, shape, granularity, device, low_res_contexts=None):
         """
         Standard sampling on GPU for context generation.
@@ -3028,8 +3062,8 @@ class FSDPProgressiveGranularityTrainer:
         if Path(cache_path).exists():
             return torch.load(cache_path, map_location='cpu')
         return {}
-    
-    def train_stage(self, stage_idx, train_dataset, val_dataset, epochs, device, embedding_cache, stage_list=[16,32,64]):
+        
+    def train_stage(self, stage_idx, train_dataset, val_dataset, full_dataset, epochs, device, embedding_cache, stage_list=[16,32,64]):
         """FSDP-compatible stage training"""
         granularity = self.granularities[stage_idx]
         use_low_res = stage_idx > 0
@@ -3043,13 +3077,13 @@ class FSDPProgressiveGranularityTrainer:
 
         if is_distributed:
             dist.barrier()
-    
+
         
-        # Precompute low-res contexts if needed
+        # Precompute low-res contexts if needed - USE full_dataset HERE
         low_res_contexts = {}
         if use_low_res:
             low_res_contexts = self.precompute_low_res_contexts(
-                stage_idx, train_dataset, device, embedding_cache
+                stage_idx, full_dataset, device, embedding_cache  # CHANGED: full_dataset instead of train_dataset
             )
 
         stage_metrics = {

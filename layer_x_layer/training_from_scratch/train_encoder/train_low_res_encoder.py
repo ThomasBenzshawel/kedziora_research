@@ -28,11 +28,29 @@ import matplotlib.pyplot as plt
 from functools import partial
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 
+
+def count_parameters(model, model_name="Model"):
+    """Count and print model parameters"""
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    print(f"\n{'='*50}")
+    print(f"{model_name} Parameters:")
+    print(f"{'='*50}")
+    print(f"  Total parameters:     {total_params:,}")
+    print(f"  Trainable parameters: {trainable_params:,}")
+    print(f"  Size (MB):            {total_params * 4 / (1024**2):.2f}")
+    print(f"{'='*50}\n")
+    
+    return total_params, trainable_params
+
+
 class ResidualBlock3D(nn.Module):
-    """Residual block for 3D convolutions with proper skip connections"""
+    """Lightweight residual block for 3D convolutions"""
     def __init__(self, in_ch, out_ch, stride=1):
         super().__init__()
         
+        # Simplified: single conv instead of two
         self.block = nn.Sequential(
             nn.Conv3d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1),
             nn.GroupNorm(min(8, out_ch), out_ch),
@@ -55,62 +73,66 @@ class ResidualBlock3D(nn.Module):
         out = self.activation(out)
         return out
 
-
 class LowResContextEncoder(nn.Module):
     """
-    Enhanced encoder with better spatial and inter-layer awareness.
+    Balanced encoder - keeps spatial attention but reduces other costs.
     """
     def __init__(self, in_channels=1, base_channels=64, mode='spatial_aware'):
         super().__init__()
         self.mode = mode
         
+        # Keep reasonable channel depth
         self.encoder = nn.ModuleList([
             ResidualBlock3D(in_channels, base_channels, stride=1),
             ResidualBlock3D(base_channels, base_channels * 2, stride=2),
-            ResidualBlock3D(base_channels * 2, base_channels * 4, stride=2),
+            ResidualBlock3D(base_channels * 2, base_channels * 4, stride=2),  # Keep 4x for better features
         ])
         
-        self.layer_pos_embedding = nn.Embedding(256, 64)
-        self.pos_projection = nn.Linear(128 + 64, 128)
+        # Smaller positional embedding is fine
+        self.layer_pos_embedding = nn.Embedding(256, 32)
+        self.pos_projection = nn.Linear(128 + 32, 128)
+        
+        final_channels = base_channels * 4
         
         if mode == 'spatial_aware':
+            # Lighter spatial processing but KEEP attention
             self.spatial_aggregator = nn.Sequential(
-                nn.Conv2d(base_channels * 4, 256, 1),
-                nn.GroupNorm(8, 256),
+                nn.Conv2d(final_channels, 128, 1),  # Reduced from 256
+                nn.GroupNorm(8, 128),
                 nn.SiLU(),
-                nn.Conv2d(256, 128, 1)
             )
+            # Keep spatial attention - it's important for quality!
             self.spatial_attention = nn.MultiheadAttention(
                 embed_dim=128,
                 num_heads=4,
-                batch_first=True
+                batch_first=True,
+                dropout=0.0  # Remove dropout for speed
             )
         elif mode == 'hierarchical':
             self.multiscale_fusion = nn.ModuleList([
                 nn.Conv2d(base_channels, 32, 1),
                 nn.Conv2d(base_channels * 2, 32, 1),
-                nn.Conv2d(base_channels * 4, 64, 1),
+                nn.Conv2d(final_channels, 64, 1),
             ])
             self.fusion_proj = nn.Linear(128, 128)
         else:
             self.layer_projection = nn.Sequential(
-                nn.Linear(base_channels * 4, 256),
-                nn.LayerNorm(256),
+                nn.Linear(final_channels * 4, 128),
+                nn.LayerNorm(128),
                 nn.SiLU(),
-                nn.Dropout(0.1),
-                nn.Linear(256, 128)
             )
         
+        # Single transformer layer is probably fine
         self.inter_layer_transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=128,
                 nhead=4,
-                dim_feedforward=512,
+                dim_feedforward=256,  # Keep reduced
                 dropout=0.1,
                 activation='gelu',
                 batch_first=True
             ),
-            num_layers=2
+            num_layers=1  # Single layer is okay
         )
     
     def forward(self, low_res_voxels, target_granularity):
@@ -138,12 +160,13 @@ class LowResContextEncoder(nn.Module):
             if self.mode == 'spatial_aware':
                 layer_feat = self.spatial_aggregator(layer_feat)
                 B_inner, C, H, W = layer_feat.shape
-                layer_feat_flat = layer_feat.flatten(2).transpose(1, 2)
+                layer_feat_flat = layer_feat.flatten(2).transpose(1, 2)  # [B, H*W, C]
                 
+                # Spatial attention to find important regions
                 layer_feat_attn, _ = self.spatial_attention(
                     layer_feat_flat, layer_feat_flat, layer_feat_flat
                 )
-                layer_feat = layer_feat_attn.mean(dim=1)
+                layer_feat = layer_feat_attn.mean(dim=1)  # [B, 128]
                 
             elif self.mode == 'hierarchical':
                 scale_features = []
@@ -177,36 +200,35 @@ class LowResContextEncoder(nn.Module):
         
         return layer_features
 
-
 class SimpleVoxelDecoder(nn.Module):
     """
-    Simple decoder that reconstructs high-res voxels from encoded features.
+    Lightweight decoder that reconstructs high-res voxels from encoded features.
+    Uses symmetric scaling to avoid wasted capacity.
     Used only during encoder training.
     """
     def __init__(self, feature_dim=128, target_granularity=32):
         super().__init__()
         self.target_granularity = target_granularity
+        self.init_size = target_granularity // 8  # 4 for target=32
         
-        # Project features to spatial representation
+        # Project layer features
         self.feature_proj = nn.Sequential(
             nn.Linear(feature_dim, 256),
             nn.SiLU(),
-            nn.Linear(256, 512),
-            nn.SiLU()
         )
         
-        # Reshape to 3D and upsample
+        # Symmetric decoder - all dimensions scale together
         self.decoder = nn.Sequential(
-            nn.ConvTranspose3d(512, 256, kernel_size=4, stride=2, padding=1),
-            nn.GroupNorm(8, 256),
-            nn.SiLU(),
-            nn.ConvTranspose3d(256, 128, kernel_size=4, stride=2, padding=1),
+            nn.ConvTranspose3d(256, 128, kernel_size=4, stride=2, padding=1),  # 4->8
             nn.GroupNorm(8, 128),
             nn.SiLU(),
-            nn.ConvTranspose3d(128, 64, kernel_size=4, stride=2, padding=1),
+            nn.ConvTranspose3d(128, 64, kernel_size=4, stride=2, padding=1),   # 8->16
             nn.GroupNorm(8, 64),
             nn.SiLU(),
-            nn.Conv3d(64, 1, kernel_size=3, padding=1),
+            nn.ConvTranspose3d(64, 32, kernel_size=4, stride=2, padding=1),    # 16->32
+            nn.GroupNorm(8, 32),
+            nn.SiLU(),
+            nn.Conv3d(32, 1, kernel_size=3, padding=1),
             nn.Sigmoid()
         )
     
@@ -219,41 +241,30 @@ class SimpleVoxelDecoder(nn.Module):
         """
         B, N, C = layer_features.shape
         
-        # Project features
-        features = self.feature_proj(layer_features)  # [B, N, 512]
+        # Project each layer's features
+        features = self.feature_proj(layer_features)  # [B, N, 256]
         
-        # Reshape to 3D volume (start small and upsample)
-        # Initial spatial size depends on target granularity
-        init_size = self.target_granularity // 8  # Will be upsampled 3x (2^3 = 8x)
+        # Reshape: [B, N, 256] -> [B, 256, 1, 1, N]
+        features = features.permute(0, 2, 1).unsqueeze(2).unsqueeze(2)
         
-        features = features.view(B, N, 512, 1, 1)  # [B, N, 512, 1, 1]
-        features = features.permute(0, 2, 3, 4, 1)  # [B, 512, 1, 1, N]
-        
-        # Expand spatially
+        # Interpolate to symmetric starting cube
+        # This aggregates the N layer features into a compact 3D representation
         features = F.interpolate(
-            features, 
-            size=(init_size, init_size, N),
+            features,
+            size=(self.init_size, self.init_size, self.init_size),
             mode='trilinear',
             align_corners=False
-        )
+        )  # [B, 256, 4, 4, 4]
         
-        # Decode to full resolution
-        voxels = self.decoder(features)
-        
-        # Final resize to exact target size
-        voxels = F.interpolate(
-            voxels,
-            size=(self.target_granularity, self.target_granularity, self.target_granularity),
-            mode='trilinear',
-            align_corners=False
-        )
+        # Decode symmetrically: 4->8->16->32
+        voxels = self.decoder(features)  # [B, 1, 32, 32, 32]
         
         return voxels
 
 
 class PairedVoxelDataset(Dataset):
     """Dataset that loads paired low-res and high-res voxel grids"""
-    def __init__(self, low_res_path, high_res_path, low_res_gran, high_res_gran, max_samples=None):
+    def __init__(self, low_res_path, high_res_path, low_res_gran, high_res_gran, max_samples=None, compute_occupancy_stats=True):
         self.low_res_path = Path(low_res_path)
         self.high_res_path = Path(high_res_path)
         self.low_res_gran = low_res_gran
@@ -276,6 +287,44 @@ class PairedVoxelDataset(Dataset):
         
         print(f"Found {len(self.file_pairs)} matching voxel pairs")
         print(f"Low-res: {low_res_gran}³, High-res: {high_res_gran}³")
+        
+        # Compute occupancy statistics from a sample of the dataset
+        self.avg_occupancy = None
+        if compute_occupancy_stats and len(self.file_pairs) > 0:
+            self._compute_occupancy_stats()
+    
+    def _compute_occupancy_stats(self, num_samples=500):
+        """Compute average occupancy from a sample of the dataset"""
+        sample_indices = np.random.choice(
+            len(self.file_pairs), 
+            min(num_samples, len(self.file_pairs)), 
+            replace=False
+        )
+        
+        low_res_occupancies = []
+        high_res_occupancies = []
+        
+        for idx in sample_indices:
+            _, high_res_file = self.file_pairs[idx]
+            low_res_file, _ = self.file_pairs[idx]
+            
+            low_res = np.load(low_res_file)
+            high_res = np.load(high_res_file)
+            
+            low_res_occupancies.append((low_res > 0.5).mean())
+            high_res_occupancies.append((high_res > 0.5).mean())
+        
+        self.avg_occupancy = np.mean(high_res_occupancies)
+        self.avg_low_res_occupancy = np.mean(low_res_occupancies)
+        
+        print(f"\n{'='*50}")
+        print("Occupancy Statistics (sampled {0} files):".format(len(sample_indices)))
+        print(f"{'='*50}")
+        print(f"  Low-res avg occupancy:  {self.avg_low_res_occupancy:.4f} ({self.avg_low_res_occupancy*100:.2f}%)")
+        print(f"  High-res avg occupancy: {self.avg_occupancy:.4f} ({self.avg_occupancy*100:.2f}%)")
+        print(f"  High-res min occupancy: {np.min(high_res_occupancies):.4f}")
+        print(f"  High-res max occupancy: {np.max(high_res_occupancies):.4f}")
+        print(f"{'='*50}\n")
     
     def __len__(self):
         return len(self.file_pairs)
@@ -287,7 +336,7 @@ class PairedVoxelDataset(Dataset):
         high_res = np.load(high_res_file).astype(np.float32)
         
         # Add channel dimension
-        low_res = torch.from_numpy(low_res).unsqueeze(0)  # [1, H, W, D]
+        low_res = torch.from_numpy(low_res).unsqueeze(0)
         high_res = torch.from_numpy(high_res).unsqueeze(0)
         
         return low_res, high_res, low_res_file.stem
@@ -325,7 +374,7 @@ def parse_args():
     parser.add_argument('--base_channels', type=int, default=64,
                         help='Base channel count for encoder')
     
-    # Distributed training
+    # Distributed training (kept for compatibility but not used in parallel mode)
     parser.add_argument('--use_fsdp', action='store_true',
                         help='Use FSDP for distributed training')
     parser.add_argument('--mixed_precision', action='store_true',
@@ -341,8 +390,9 @@ def parse_args():
 
 
 def setup_distributed():
-    """Initialize distributed training"""
+    """Initialize distributed training if environment variables are set"""
     if 'RANK' not in os.environ:
+        # Single GPU mode
         return False, 0, 1, 0
     
     rank = int(os.environ['RANK'])
@@ -383,14 +433,15 @@ def get_fsdp_config(args):
     }
 
 
-def train_epoch(encoder, decoder, dataloader, optimizer, device, epoch, rank, world_size):
+def train_epoch(encoder, decoder, dataloader, optimizer, device, epoch, rank, world_size, target_occupancy=None):
     """Training loop for one epoch"""
     encoder.train()
     decoder.train()
     
     total_loss = 0
     total_mse = 0
-    total_occupancy_diff = 0
+    total_pred_occupancy = 0
+    total_true_occupancy = 0
     num_batches = 0
     
     for batch_idx, (low_res, high_res, stems) in enumerate(dataloader):
@@ -400,25 +451,43 @@ def train_epoch(encoder, decoder, dataloader, optimizer, device, epoch, rank, wo
         optimizer.zero_grad()
         
         # Encode low-res features
-        features = encoder(low_res, high_res.shape[-1])  # [B, N, 128]
+        features = encoder(low_res, high_res.shape[-1])
         
         # Decode to high-res
-        pred_high_res = decoder(features)  # [B, 1, H, W, D]
+        pred_high_res = decoder(features)
         
-        # Compute losses
-        mse_loss = F.mse_loss(pred_high_res, high_res)
-        
-        # Occupancy loss (encourage similar occupancy patterns)
-        pred_occupancy = (pred_high_res > 0.5).float().mean()
+        # Compute occupancy values
+        pred_occupancy = pred_high_res.mean()
         true_occupancy = (high_res > 0.5).float().mean()
-        occupancy_loss = F.mse_loss(pred_occupancy, true_occupancy)
         
-        # Feature diversity loss (prevent mode collapse)
-        feature_std = features.std(dim=0).mean()
-        diversity_loss = torch.exp(-feature_std)  # Penalize low diversity
+        # === LOSS COMPUTATION ===
+        
+        # 1. Weighted MSE loss - weight occupied voxels more heavily
+        # This helps prevent the model from just predicting zeros
+        occupied_mask = (high_res > 0.5).float()
+        empty_mask = 1.0 - occupied_mask
+        
+        # Weight occupied voxels more (inverse of occupancy ratio)
+        # If occupancy is 10%, occupied voxels get ~9x weight
+        occupancy_ratio = true_occupancy.clamp(min=0.01)  # Avoid division by zero
+        pos_weight = (1.0 - occupancy_ratio) / occupancy_ratio
+        pos_weight = pos_weight.clamp(max=20.0)  # Cap the weight to avoid instability
+        
+        # Weighted MSE
+        squared_error = (pred_high_res - high_res) ** 2
+        weighted_squared_error = squared_error * (empty_mask + occupied_mask * pos_weight)
+        mse_loss = weighted_squared_error.mean()
+        
+        # 2. Occupancy matching loss (symmetric)
+        occupancy_match_loss = F.mse_loss(pred_occupancy, true_occupancy)
+        
+        # 3. Under-prediction penalty - extra penalty if pred_occupancy < true_occupancy
+        # This asymmetric term specifically fights the "predict all zeros" failure mode
+        occupancy_deficit = F.relu(true_occupancy - pred_occupancy)  # Only penalize under-prediction
+        under_pred_penalty = occupancy_deficit ** 2
         
         # Combined loss
-        loss = mse_loss + 0.1 * occupancy_loss + 0.01 * diversity_loss
+        loss = mse_loss + 0.1 * occupancy_match_loss + 0.5 * under_pred_penalty
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(
@@ -430,26 +499,30 @@ def train_epoch(encoder, decoder, dataloader, optimizer, device, epoch, rank, wo
         # Accumulate metrics
         total_loss += loss.item()
         total_mse += mse_loss.item()
-        total_occupancy_diff += abs(pred_occupancy.item() - true_occupancy.item())
+        total_pred_occupancy += pred_occupancy.item()
+        total_true_occupancy += true_occupancy.item()
         num_batches += 1
     
-    # Synchronize metrics across ranks
+    # Synchronize metrics across ranks (only if distributed)
     if world_size > 1:
         metrics = torch.tensor(
-            [total_loss, total_mse, total_occupancy_diff, num_batches],
+            [total_loss, total_mse, total_pred_occupancy, total_true_occupancy, num_batches],
             device=device
         )
         dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
-        total_loss, total_mse, total_occupancy_diff, num_batches = metrics.tolist()
+        total_loss, total_mse, total_pred_occupancy, total_true_occupancy, num_batches = metrics.tolist()
     
     avg_loss = total_loss / num_batches
     avg_mse = total_mse / num_batches
-    avg_occ_diff = total_occupancy_diff / num_batches
+    avg_pred_occ = total_pred_occupancy / num_batches
+    avg_true_occ = total_true_occupancy / num_batches
     
     return {
         'loss': avg_loss,
         'mse': avg_mse,
-        'occupancy_diff': avg_occ_diff
+        'pred_occupancy': avg_pred_occ,
+        'true_occupancy': avg_true_occ,
+        'occupancy_diff': avg_pred_occ - avg_true_occ
     }
 
 
@@ -460,6 +533,8 @@ def validate(encoder, decoder, dataloader, device, rank, world_size):
     
     total_loss = 0
     total_mse = 0
+    total_pred_occupancy = 0
+    total_true_occupancy = 0
     num_batches = 0
     
     with torch.no_grad():
@@ -470,20 +545,36 @@ def validate(encoder, decoder, dataloader, device, rank, world_size):
             features = encoder(low_res, high_res.shape[-1])
             pred_high_res = decoder(features)
             
+            # Standard MSE for validation (unweighted for fair comparison)
             mse_loss = F.mse_loss(pred_high_res, high_res)
+            
+            # Track occupancy
+            pred_occupancy = pred_high_res.mean()
+            true_occupancy = (high_res > 0.5).float().mean()
             
             total_loss += mse_loss.item()
             total_mse += mse_loss.item()
+            total_pred_occupancy += pred_occupancy.item()
+            total_true_occupancy += true_occupancy.item()
             num_batches += 1
     
     if world_size > 1:
-        metrics = torch.tensor([total_loss, total_mse, num_batches], device=device)
+        metrics = torch.tensor(
+            [total_loss, total_mse, total_pred_occupancy, total_true_occupancy, num_batches], 
+            device=device
+        )
         dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
-        total_loss, total_mse, num_batches = metrics.tolist()
+        total_loss, total_mse, total_pred_occupancy, total_true_occupancy, num_batches = metrics.tolist()
+    
+    avg_pred_occ = total_pred_occupancy / num_batches
+    avg_true_occ = total_true_occupancy / num_batches
     
     return {
         'val_loss': total_loss / num_batches,
-        'val_mse': total_mse / num_batches
+        'val_mse': total_mse / num_batches,
+        'val_pred_occupancy': avg_pred_occ,
+        'val_true_occupancy': avg_true_occ,
+        'val_occupancy_diff': avg_pred_occ - avg_true_occ
     }
 
 
@@ -515,7 +606,7 @@ def save_checkpoint(encoder, optimizer, epoch, metrics, output_path, rank, use_f
 def main():
     args = parse_args()
     
-    # Setup distributed training
+    # Setup distributed training (will return single-GPU config if not distributed)
     is_distributed, rank, world_size, local_rank = setup_distributed()
     
     if is_distributed:
@@ -524,6 +615,12 @@ def main():
     else:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Running on single device: {device}")
+        
+        # Print GPU info for single-GPU mode
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            print(f"GPU: {gpu_name} ({gpu_memory:.1f} GB)")
     
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -591,6 +688,7 @@ def main():
         print("="*60)
         print(f"Encoder mode: {args.encoder_mode}")
         print(f"Base channels: {args.base_channels}")
+        print(f"Target granularity: {args.high_res_gran}")
     
     encoder = LowResContextEncoder(
         in_channels=1,
@@ -603,7 +701,20 @@ def main():
         target_granularity=args.high_res_gran
     ).to(device)
     
-    # Apply FSDP if requested
+    # Print parameter counts
+    if rank == 0:
+        enc_total, enc_trainable = count_parameters(encoder, "LowResContextEncoder")
+        dec_total, dec_trainable = count_parameters(decoder, "SimpleVoxelDecoder")
+        
+        print(f"\n{'='*50}")
+        print(f"Combined Model Summary:")
+        print(f"{'='*50}")
+        print(f"  Total parameters:     {enc_total + dec_total:,}")
+        print(f"  Trainable parameters: {enc_trainable + dec_trainable:,}")
+        print(f"  Combined size (MB):   {(enc_total + dec_total) * 4 / (1024**2):.2f}")
+        print(f"{'='*50}\n")
+    
+    # Apply FSDP if requested (typically not used in parallel single-GPU mode)
     if args.use_fsdp and is_distributed:
         fsdp_config = get_fsdp_config(args)
         encoder = FSDP(encoder, **fsdp_config)
@@ -628,12 +739,21 @@ def main():
         print("\n" + "="*60)
         print("Starting Training")
         print("="*60)
+        print(f"  Epochs: {args.epochs}")
+        print(f"  Batch size: {args.batch_size}")
+        print(f"  Learning rate: {args.learning_rate}")
+        print(f"  Resolution: {args.low_res_gran}³ → {args.high_res_gran}³")
+        print("="*60 + "\n")
     
     metrics_history = {
         'train_loss': [],
         'train_mse': [],
+        'train_pred_occupancy': [],
+        'train_true_occupancy': [],
         'val_loss': [],
         'val_mse': [],
+        'val_pred_occupancy': [],
+        'val_true_occupancy': [],
         'epochs': []
     }
     
@@ -649,7 +769,8 @@ def main():
         # Train
         train_metrics = train_epoch(
             encoder, decoder, train_loader, optimizer,
-            device, epoch, rank, world_size
+            device, epoch, rank, world_size,
+            target_occupancy=full_dataset.avg_occupancy
         )
         
         # Validate
@@ -664,15 +785,20 @@ def main():
             epoch_pbar.set_postfix({
                 'loss': f'{train_metrics["loss"]:.4f}',
                 'mse': f'{train_metrics["mse"]:.4f}',
-                'val_loss': f'{val_metrics["val_loss"]:.4f}',
+                'pred_occ': f'{train_metrics["pred_occupancy"]:.3f}',
+                'true_occ': f'{train_metrics["true_occupancy"]:.3f}',
                 'val_mse': f'{val_metrics["val_mse"]:.4f}'
             })
             
             # Save metrics
             metrics_history['train_loss'].append(train_metrics['loss'])
             metrics_history['train_mse'].append(train_metrics['mse'])
+            metrics_history['train_pred_occupancy'].append(train_metrics['pred_occupancy'])
+            metrics_history['train_true_occupancy'].append(train_metrics['true_occupancy'])
             metrics_history['val_loss'].append(val_metrics['val_loss'])
             metrics_history['val_mse'].append(val_metrics['val_mse'])
+            metrics_history['val_pred_occupancy'].append(val_metrics['val_pred_occupancy'])
+            metrics_history['val_true_occupancy'].append(val_metrics['val_true_occupancy'])
             metrics_history['epochs'].append(epoch)
         
         # Save checkpoint
@@ -680,7 +806,7 @@ def main():
             checkpoint_path = output_dir / f'encoder_epoch_{epoch}.pth'
             save_checkpoint(
                 encoder, optimizer, epoch, metrics_history,
-                checkpoint_path, rank, args.use_fsdp
+                checkpoint_path, rank, args.use_fsdp and is_distributed
             )
         
         # Save best model
@@ -689,7 +815,7 @@ def main():
             best_path = output_dir / 'encoder_best.pth'
             save_checkpoint(
                 encoder, optimizer, epoch, metrics_history,
-                best_path, rank, args.use_fsdp
+                best_path, rank, args.use_fsdp and is_distributed
             )
             if rank == 0:
                 tqdm.write(f"  ✓ New best model! Val Loss: {best_val_loss:.4f}")
@@ -701,7 +827,7 @@ def main():
     final_path = output_dir / 'encoder_final.pth'
     save_checkpoint(
         encoder, optimizer, args.epochs, metrics_history,
-        final_path, rank, args.use_fsdp
+        final_path, rank, args.use_fsdp and is_distributed
     )
     
     # Save metrics
@@ -710,7 +836,7 @@ def main():
             json.dump(metrics_history, f, indent=2)
         
         # Plot training curves
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
         
         axes[0].plot(metrics_history['epochs'], metrics_history['train_loss'], label='Train')
         axes[0].plot(metrics_history['epochs'], metrics_history['val_loss'], label='Val')
@@ -727,6 +853,16 @@ def main():
         axes[1].set_title('Reconstruction MSE')
         axes[1].legend()
         axes[1].grid(True, alpha=0.3)
+        
+        axes[2].plot(metrics_history['epochs'], metrics_history['train_pred_occupancy'], label='Pred (Train)', linestyle='-')
+        axes[2].plot(metrics_history['epochs'], metrics_history['train_true_occupancy'], label='True (Train)', linestyle='--')
+        axes[2].plot(metrics_history['epochs'], metrics_history['val_pred_occupancy'], label='Pred (Val)', linestyle='-', alpha=0.7)
+        axes[2].plot(metrics_history['epochs'], metrics_history['val_true_occupancy'], label='True (Val)', linestyle='--', alpha=0.7)
+        axes[2].set_xlabel('Epoch')
+        axes[2].set_ylabel('Occupancy')
+        axes[2].set_title('Predicted vs True Occupancy')
+        axes[2].legend()
+        axes[2].grid(True, alpha=0.3)
         
         plt.tight_layout()
         plt.savefig(output_dir / 'training_curves.png', dpi=150)

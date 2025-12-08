@@ -7,12 +7,26 @@ import sys
 import time
 import traceback
 import gc
+import warnings
 import numpy as np
 import trimesh
 from datetime import datetime
 from scipy.spatial import ConvexHull
 from sklearn.decomposition import PCA
 import multiprocessing as mp
+from PIL import Image
+
+
+def configure_warnings():
+    """Configure warning filters for cleaner output"""
+    # Suppress trimesh cross-product warnings (common with imperfect meshes)
+    warnings.filterwarnings('ignore', 
+                           message='invalid value encountered in divide',
+                           category=RuntimeWarning, 
+                           module='trimesh')
+    
+    # Handle large textures in GLB files
+    Image.MAX_IMAGE_PIXELS = 200_000_000  # Allow larger images (~200 megapixels)
 
 
 def setup_logging():
@@ -27,6 +41,7 @@ def setup_logging():
         handlers=handlers
     )
     return logging.getLogger(__name__)
+
 
 def rotation_matrix_from_vectors(vec1, vec2):
     """Find rotation matrix that aligns vec1 to vec2"""
@@ -47,7 +62,7 @@ def rotation_matrix_from_vectors(vec1, vec2):
         if c > 0:
             return np.eye(3)
         else:
-            # 180-degree rotation
+            # Find an orthogonal vector for 180-degree rotation
             if abs(a[0]) < 0.9:
                 orthogonal = np.array([1, 0, 0])
             else:
@@ -59,6 +74,7 @@ def rotation_matrix_from_vectors(vec1, vec2):
     kmat = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
     rotation_matrix = np.eye(3) + kmat + kmat.dot(kmat) * ((1 - c) / (s ** 2))
     return rotation_matrix
+
 
 def compute_pca_rotation(vertices):
     """Compute PCA-based rotation matrix"""
@@ -255,33 +271,61 @@ def voxelize_mesh(mesh, voxel_resolution):
 
 def validate_voxel_tensor(voxel_tensor, logger=None):
     """Validate the voxel tensor for training compatibility"""
-    warnings = []
+    warnings_list = []
     
     # Check if cubic
     if len(set(voxel_tensor.shape)) != 1:
-        warnings.append(f"Non-cubic grid: {voxel_tensor.shape}")
+        warnings_list.append(f"Non-cubic grid: {voxel_tensor.shape}")
     
     # Check if not empty
     occupied = np.sum(voxel_tensor)
     if occupied == 0:
-        warnings.append("Empty voxel grid")
+        warnings_list.append("Empty voxel grid")
     
     # Check if bottom-aligned (should have voxels near Z=0)
     bottom_slice = voxel_tensor[:, :, :5]
     if np.sum(bottom_slice) == 0:
-        warnings.append("No voxels near bottom (Z=0)")
+        warnings_list.append("No voxels near bottom (Z=0)")
     
     # Check if too sparse or too dense
     fill_ratio = occupied / voxel_tensor.size
     if fill_ratio < 0.001:
-        warnings.append(f"Very sparse: {fill_ratio:.4%} filled")
+        warnings_list.append(f"Very sparse: {fill_ratio:.4%} filled")
     elif fill_ratio > 0.9:
-        warnings.append(f"Very dense: {fill_ratio:.4%} filled")
+        warnings_list.append(f"Very dense: {fill_ratio:.4%} filled")
     
-    if warnings and logger:
-        logger.warning(f"Validation warnings: {', '.join(warnings)}")
+    if warnings_list and logger:
+        logger.warning(f"Validation warnings: {', '.join(warnings_list)}")
     
-    return warnings
+    return warnings_list
+
+
+def clean_mesh(mesh, logger=None):
+    """
+    Clean mesh by removing degenerate faces, duplicate vertices, etc.
+    Uses the modern trimesh API (March 2024+).
+    """
+    try:
+        # Remove degenerate and duplicate faces in one pass
+        # nondegenerate_faces(height) identifies faces with oriented bounding box
+        # shorter than height on one side
+        mask = mesh.unique_faces() & mesh.nondegenerate_faces(height=1e-8)
+        mesh.update_faces(mask)
+        
+        # Remove vertices that are no longer referenced
+        mesh.remove_unreferenced_vertices()
+        
+        # Merge duplicate/near-duplicate vertices
+        mesh.merge_vertices()
+        
+        # Fix face winding and normals
+        mesh.fix_normals()
+        
+        return mesh
+    except Exception as e:
+        if logger:
+            logger.warning(f"Mesh cleaning failed: {e}")
+        return mesh
 
 
 def glb_to_voxel_tensor(glb_path, output_path, metadata_path, voxel_resolution=64, 
@@ -298,6 +342,7 @@ def glb_to_voxel_tensor(glb_path, output_path, metadata_path, voxel_resolution=6
         # Load mesh
         mesh = trimesh.load(glb_path, force='mesh')
         
+        # Convert Scene to Trimesh FIRST (before cleaning)
         if not isinstance(mesh, trimesh.Trimesh):
             if isinstance(mesh, trimesh.Scene):
                 scene = mesh
@@ -307,13 +352,8 @@ def glb_to_voxel_tensor(glb_path, output_path, metadata_path, voxel_resolution=6
             else:
                 raise ValueError(f"Unsupported mesh type: {type(mesh)}")
         
-        # NOW clean the mesh (after we know it's a Trimesh)
-        mask = mesh.unique_faces() & mesh.nondegenerate_faces(height=1e-8)
-        mesh.update_faces(mask)
-        
-        mesh.remove_unreferenced_vertices()
-        mesh.merge_vertices()
-        mesh.fix_normals()
+        # Clean the mesh (after we know it's a Trimesh)
+        mesh = clean_mesh(mesh, logger)
         
         # Validate mesh before processing
         if len(mesh.vertices) == 0:
@@ -435,6 +475,9 @@ def process_single_file(args):
     # Import here to avoid sharing memory between processes
     import logging
     import sys
+    
+    # Configure warnings for this subprocess
+    configure_warnings()
     
     # Set up minimal logging for this process
     logger = logging.getLogger(__name__)
@@ -622,6 +665,9 @@ def main():
     # Set check_dir to output_dir if not specified
     if args.check_dir is None:
         args.check_dir = args.output_dir
+    
+    # Configure warnings in main process
+    configure_warnings()
     
     # Set up logging
     logger = setup_logging()
