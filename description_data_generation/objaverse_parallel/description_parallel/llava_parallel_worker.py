@@ -161,8 +161,8 @@ def optimized_inference(model, tokenizer, input_ids, images, image_sizes, max_ne
         with torch.autocast(device_type='cuda', dtype=dtype):
             response = model.generate(
                 input_ids,
-                images=images,
-                image_sizes=image_sizes,
+                images=images if images else None,
+                image_sizes=image_sizes if image_sizes else None,
                 do_sample=True,  # Allow some creativity
                 temperature=0.1,  # Very low but not zero for slight variation
                 top_p=0.9,  # Nucleus sampling for better quality
@@ -358,9 +358,10 @@ def get_worker_items(file_list_path, images_base_dir, output_dir, worker_id, tot
     items_to_process = []
     for uid, image_folder in worker_items:
         output_file = Path(output_dir) / f"{uid}.txt"
+        short_output_file = Path(output_dir) / f"{uid}_short.txt"
         
-        # Check if output already exists
-        if output_file.exists():
+        # Check if both outputs already exist
+        if output_file.exists() and short_output_file.exists():
             continue
         
         # Check if image folder exists and has exactly 6 images
@@ -454,8 +455,9 @@ def image_data_augmentation(uid, image_folder, metadata_cache, tokenizer, model,
     """Process a single object using its UID (matches voxel naming)"""
     object_start_time = time()
     output_file = Path(output_dir) / f"{uid}.txt"
+    short_output_file = Path(output_dir) / f"{uid}_short.txt"
     
-    if output_file.exists():
+    if output_file.exists() and short_output_file.exists():
         return None
     
     # Get object name from cache
@@ -539,6 +541,27 @@ def image_data_augmentation(uid, image_folder, metadata_cache, tokenizer, model,
     
     with open(output_file, "w") as f:
         f.write(final_output)
+    
+    # Generate a one-line summary
+    summary_question = f"""Please summarize the following description into a single concise one-line summary that captures the essential form and identity of the object:
+
+{final_output}
+
+Provide ONLY the one-line summary, nothing else."""
+
+    conv_summary = copy.deepcopy(conv_templates[conv_template])
+    conv_summary.append_message(conv_summary.roles[0], summary_question)
+    conv_summary.append_message(conv_summary.roles[1], None)
+    prompt_summary = conv_summary.get_prompt()
+    
+    summary_input_ids = tokenizer_image_token(prompt_summary, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
+    
+    summary_output = optimized_inference(
+        model, tokenizer, summary_input_ids, [], [], max_new_tokens=256
+    )
+    
+    with open(short_output_file, "w") as f:
+        f.write(summary_output.strip())
     
     time_taken = time() - object_start_time
     return time_taken

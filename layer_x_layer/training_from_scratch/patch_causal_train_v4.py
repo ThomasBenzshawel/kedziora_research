@@ -125,6 +125,9 @@ def parse_args():
                         help='Disable teacher forcing during training')
     parser.add_argument('--test_run', action='store_true',
                         help='Run a quick test training loop')
+    parser.add_argument('--use_generated_low_res', action='store_true',
+                        help='Use model-generated low-res contexts instead of ground truth '
+                        '(slower but may be more realistic)')
 
     return parser.parse_args()
 
@@ -2098,7 +2101,6 @@ class LayerXLayerDiffusionTrainerV4:
 
     def train_step(self, x0, context, low_res_context=None):
         """Training step with backward pass."""
-        # Compute loss = predict and calc loss, just combined into one call for convenience, it is either parallel or non parallel training versions
         return self.compute_loss(x0, context, low_res_context, backward=True)
 
     def compute_loss(self, x0, context, low_res_context=None, backward=True):
@@ -2111,7 +2113,9 @@ class LayerXLayerDiffusionTrainerV4:
     def compute_loss_parallel(self, x0, context, low_res_context=None, backward=True):
         """
         Different random timestep per layer for more diverse gradients.
-        Can help with training stability and coverage.
+        low_res_context can be either:
+          - Precomputed/generated contexts [B, 1, H, W, D]
+          - Ground truth low-res voxels [B, 1, H, W, D]
         """
         if backward:
             self.model.train()
@@ -2139,23 +2143,19 @@ class LayerXLayerDiffusionTrainerV4:
             sqrt_one_minus = self.diffusion.sqrt_one_minus_alpha_hats[t_l].view(B, 1, 1, 1).to(model_dtype)
             x_noisy[:, l] = sqrt_alpha * all_layers[:, l] + sqrt_one_minus * noise[:, l]
         
+        # Process low-res context through encoder if available
         low_res_features = None
         if low_res_context is not None and model.use_low_res_context:
             with torch.no_grad():
                 low_res_features = model.low_res_encoder(
                     low_res_context.to(model_dtype), L
                 ).detach()
-        
-        if low_res_features is not None:
-            print(f"[DEBUG rank {dist.get_rank() if dist.is_initialized() else 0}]")
-            print(f"  x_noisy_all.shape = {x_noisy.shape}")  # Should be [B, L, C, H, W]
-            print(f"  low_res_features.shape = {low_res_features.shape}")  # Should be [B, L, 128]
-            print(f"  Batch sizes match: {x_noisy.shape[0] == low_res_features.shape[0]}")
             
         predicted_noise = model(
             x_noisy, t_all, context.to(model_dtype), all_layers,
             low_res_features=low_res_features
         )
+        
         if args.use_ddp and args.mixed_precision:
             with autocast(dtype=torch.bfloat16, device_type='cuda'):
                 loss = F.mse_loss(predicted_noise.float(), noise.float())
@@ -2181,6 +2181,7 @@ class LayerXLayerDiffusionTrainerV4:
     def compute_loss_sequential(self, x0, context, low_res_context=None, backward=True, chunk_divide=2):
         """
         Original sequential layer-by-layer training (slower but lower memory).
+        low_res_context can be either precomputed contexts or ground truth low-res.
         """
         if backward:
             self.model.train()
@@ -2195,11 +2196,11 @@ class LayerXLayerDiffusionTrainerV4:
         prev_layers_list = []
         model = self.unwrapped_model
 
-        # Prepare low-res features
+        # Prepare low-res features from whatever source we have
         low_res_features = None
         if low_res_context is not None and model.use_low_res_context:
             with torch.no_grad():
-                low_res_features = self.model.low_res_encoder(
+                low_res_features = model.low_res_encoder(
                     low_res_context.to(model_dtype),
                     model.granularity
                 ).detach()
@@ -2323,12 +2324,16 @@ class LayerXLayerDiffusionTrainerV4:
             return voxel_grid.clamp(0, 1)
 
 class VoxelDataset(Dataset):
-    def __init__(self, npy_folder_path, description_folder_path, transform=None, 
-                 granularity=128, test_count=0, enable_fuzzy_matching=False):
-        self.npy_folder_path = Path(npy_folder_path)
+    def __init__(self, description_folder_path, transform=None, 
+                 granularity=128, test_count=0, enable_fuzzy_matching=False, include_lower_res=False):
+        self.base_path = f'/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_voxels/'
+        self.npy_folder_path = Path(self.base_path) / f'{granularity}'
+        self.lower_resolution_npy_folder_path = Path(self.base_path) / f'{granularity // 2}'
         self.description_folder_path = Path(description_folder_path)
         self.transform = transform
         self.granularity = granularity
+        self.include_lower_res = include_lower_res  # Store the flag
+        self.lower_res_granularity = granularity // 2
         self.default_description = [
             "A 3D model of an object.",
             "A geometric shape in 3D space.",
@@ -2338,7 +2343,7 @@ class VoxelDataset(Dataset):
             "A voxel-based 3D object.",
             "A 3D shape made of voxels.",
         ]
-        
+        self.include_lower_res = include_lower_res
         self.enable_fuzzy_matching = enable_fuzzy_matching
         
         # Track description misses for debugging
@@ -2349,7 +2354,7 @@ class VoxelDataset(Dataset):
         # Only store file paths (minimal memory)
         if test_count is not None and test_count > 0:
             file_list = []
-            for entry in os.scandir(npy_folder_path):
+            for entry in os.scandir(self.npy_folder_path):
                 if entry.name.endswith('.npy') and entry.is_file():
                     file_list.append(self.npy_folder_path / entry.name)
                     if len(file_list) >= test_count:
@@ -2358,7 +2363,7 @@ class VoxelDataset(Dataset):
         else:
             file_list = [
                 self.npy_folder_path / entry.name
-                for entry in os.scandir(npy_folder_path)
+                for entry in os.scandir(self.npy_folder_path)
                 if entry.name.endswith('.npy') and entry.is_file()
             ]
         
@@ -2376,10 +2381,14 @@ class VoxelDataset(Dataset):
             self.available_descriptions = None
             print("Fuzzy matching disabled - descriptions loaded on-demand only")
         
-        print(f"Found {len(self.file_list)} .npy files in {npy_folder_path}")
+        print(f"Found {len(self.file_list)} .npy files in {self.npy_folder_path}")
         print(f"Voxel grid granularity: {self.granularity}x{self.granularity}x{self.granularity}")
+        if self.include_lower_res:
+            print(f"Lower resolution enabled: {self.lower_res_granularity}x{self.lower_res_granularity}x{self.lower_res_granularity}")
+            print(f"Lower resolution path: {self.lower_resolution_npy_folder_path}")
         print(f"Descriptions will be loaded on-demand from {description_folder_path}")
-    
+
+
     @lru_cache(maxsize=10000)  # Cache recently accessed descriptions
     def _load_description(self, filename_stem):
         """Load a single description file on-demand with caching"""
@@ -2443,12 +2452,34 @@ class VoxelDataset(Dataset):
         
         voxel_grid = torch.from_numpy(voxel_grid).unsqueeze(0)  # Add channel dimension
         
+        # Load lower resolution voxel data if enabled
+        if self.include_lower_res:
+            lower_res_path = self.lower_resolution_npy_folder_path / self.file_list[idx].name
+            if lower_res_path.exists():
+                lower_res_voxel_grid = np.load(lower_res_path).astype(np.float16)
+                assert lower_res_voxel_grid.shape == (self.lower_res_granularity, self.lower_res_granularity, self.lower_res_granularity), \
+                    f"Lower res voxel grid shape {lower_res_voxel_grid.shape} does not match expected shape {(self.lower_res_granularity,)*3}"
+                
+                if self.transform:
+                    lower_res_voxel_grid = self.transform(lower_res_voxel_grid)
+                
+                lower_res_voxel_grid = torch.from_numpy(lower_res_voxel_grid).unsqueeze(0)
+            else:
+                # Return zeros if lower res file doesn't exist
+                print(f"Warning: Lower resolution file not found: {lower_res_path}")
+                lower_res_voxel_grid = torch.zeros(1, self.lower_res_granularity, self.lower_res_granularity, self.lower_res_granularity, dtype=torch.float16)
+        else:
+            lower_res_voxel_grid = None
+        
         # Load description on-demand (cached)
         filename_key = self.file_list[idx].stem
         description = self._load_description(filename_key)
         
-        return voxel_grid, description, filename_key
-    
+        if self.include_lower_res:
+            return voxel_grid, lower_res_voxel_grid, description, filename_key
+        else:
+            return voxel_grid, description, filename_key
+
     def save_miss_report(self, output_path="description_misses.txt"):
         """Save a report of all description misses"""
         if not self.description_misses:
@@ -2660,11 +2691,11 @@ class FSDPProgressiveGranularityTrainer:
 
             # Create one dataset with all the data you want
             full_dataset = VoxelDataset(
-                npy_folder_path=f'/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_voxels/{granularity}',
-                description_folder_path='/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_descriptions',
                 granularity=granularity,
+                description_folder_path='/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_descriptions',
                 test_count=data_size + 1000,  # Total samples needed (train + val)
-                enable_fuzzy_matching=args.enable_fuzzy_matching
+                enable_fuzzy_matching=args.enable_fuzzy_matching,
+                include_lower_res=(stage_idx > 0)
             )
 
             # Split into train and validation
@@ -2681,7 +2712,7 @@ class FSDPProgressiveGranularityTrainer:
                 stage_idx=stage_idx,
                 train_dataset=stage_train_dataset,
                 val_dataset=stage_val_dataset,
-                full_dataset=full_dataset,  # ADD THIS
+                full_dataset=full_dataset,
                 epochs=epochs,
                 device=device,
                 embedding_cache=embedding_cache,
@@ -2820,11 +2851,9 @@ class FSDPProgressiveGranularityTrainer:
         return prev_model
         
     def precompute_low_res_contexts(self, stage_idx, dataset, device, 
-                                embedding_cache, batch_size=4):
+                                embedding_cache, batch_size=4, use_ground_truth=True):
         """
         Precompute all low-res contexts before training starts.
-        Handles recursive context loading (stage 2 needs stage 1 contexts, 
-        which were generated with stage 0 contexts).
         
         Args:
             stage_idx: Current stage index
@@ -2832,18 +2861,27 @@ class FSDPProgressiveGranularityTrainer:
             device: Device to run on
             embedding_cache: T5 embedding cache
             batch_size: Batch size for generation
+            use_ground_truth: If True, return empty dict (GT loaded from dataset).
+                            If False, generate contexts using previous stage model.
         """
         if stage_idx == 0:
             return {}
         
-        print_main(f"\nPrecomputing low-res contexts for stage {stage_idx}...")
+        # If using ground truth, we don't need to precompute
+        # The ground truth will be loaded directly from the dataset
+        if use_ground_truth:
+            print_main(f"\nUsing ground truth low-res for stage {stage_idx} - no precomputation needed")
+            return {}
         
+        print_main(f"\nPrecomputing low-res contexts for stage {stage_idx}...")
+        print_main(f"  Mode: Model Generation")
+            
         # Check if cache already exists
-        cache_path = f'low_res_context_stage{stage_idx}.pth'
+        cache_suffix = "_gt" if use_ground_truth else "_gen"
+        cache_path = f'low_res_context_stage{stage_idx}{cache_suffix}.pth'
         if Path(cache_path).exists():
             print_main(f"✓ Loading existing cache from {cache_path}")
             low_res_contexts = torch.load(cache_path, map_location='cpu')
-            print_main(f"✓ Loaded {len(low_res_contexts)} cached contexts")
 
             # check if the number of cached contexts matches the dataset size
             if len(low_res_contexts) == len(dataset):
@@ -2852,31 +2890,16 @@ class FSDPProgressiveGranularityTrainer:
             else:
                 print_main(f"⚠ Cache size {len(low_res_contexts)} does not match dataset size {len(dataset)}. Regenerating contexts...")
         
-        # Load previous stage model on GPU
-        prev_model = self.load_prev_stage_model_gpu(stage_idx, device)
-        
-        # RECURSIVE: Load contexts for the PREVIOUS stage
-        prev_low_res_contexts = {}
-        if stage_idx > 1:
-            prev_context_path = f'low_res_context_stage{stage_idx - 1}.pth'
-            if Path(prev_context_path).exists():
-                print_main(f"  Loading recursive contexts from {prev_context_path}...")
-                prev_low_res_contexts = torch.load(prev_context_path, map_location='cpu')
-                print_main(f"  ✓ Loaded {len(prev_low_res_contexts)} recursive contexts")
-        
-        low_res_contexts = {}
         curr_granularity = self.granularities[stage_idx]
         prev_granularity = self.granularities[stage_idx - 1]
+        low_res_contexts = {}
         
         if rank == 0:
             # Handle both VoxelDataset and Subset
             if hasattr(dataset, 'file_list'):
-                # It's a VoxelDataset
                 file_list = dataset.file_list
             elif hasattr(dataset, 'dataset'):
-                # It's a Subset - get file_list from underlying dataset
                 underlying_dataset = dataset.dataset
-                # Get the indices that are part of this subset
                 indices = dataset.indices
                 file_list = [underlying_dataset.file_list[i] for i in indices]
             else:
@@ -2888,11 +2911,11 @@ class FSDPProgressiveGranularityTrainer:
             
             # Create dataset for previous granularity
             prev_dataset = VoxelDataset(
-                npy_folder_path=f'/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_voxels/{prev_granularity}',
-                description_folder_path='/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_descriptions',
                 granularity=prev_granularity,
-                test_count=0,  # Load ALL files, not just 100
-                enable_fuzzy_matching=args.enable_fuzzy_matching
+                description_folder_path='/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_descriptions',
+                test_count=0,
+                enable_fuzzy_matching=args.enable_fuzzy_matching,
+                include_lower_res=(stage_idx > 1)
             )
             
             # Filter to only files that exist in current dataset
@@ -2909,6 +2932,25 @@ class FSDPProgressiveGranularityTrainer:
             
             # Create filtered dataset
             prev_dataset.file_list = prev_file_list
+        
+            # ========== MODEL GENERATION MODE ==========
+            # Load previous stage model and generate samples
+            print_main(f"  Generating contexts using stage {stage_idx - 1} model")
+            
+            # Load previous stage model on GPU
+            prev_model = self.load_prev_stage_model_gpu(stage_idx, device)
+            
+            # RECURSIVE: Load contexts for the PREVIOUS stage
+            prev_low_res_contexts = {}
+            if stage_idx > 1:
+                # Try ground truth first, then generated
+                for suffix in ["_gt", "_gen", ""]:
+                    prev_context_path = f'low_res_context_stage{stage_idx - 1}{suffix}.pth'
+                    if Path(prev_context_path).exists():
+                        print_main(f"  Loading recursive contexts from {prev_context_path}...")
+                        prev_low_res_contexts = torch.load(prev_context_path, map_location='cpu')
+                        print_main(f"  ✓ Loaded {len(prev_low_res_contexts)} recursive contexts")
+                        break
             
             prev_loader = DataLoader(
                 prev_dataset, 
@@ -2922,7 +2964,7 @@ class FSDPProgressiveGranularityTrainer:
             # Generate low-res voxels using previous stage model
             with torch.no_grad():
                 for batch_idx, batch_data in enumerate(tqdm(
-                    prev_loader, desc="Generating low-res contexts"
+                    prev_loader, desc="Generating low-res contexts via model"
                 )):
                     x0, descriptions, file_stems = batch_data
                     
@@ -2958,40 +3000,47 @@ class FSDPProgressiveGranularityTrainer:
                         prev_model, context, x0.shape, prev_granularity, device,
                         low_res_contexts=batch_prev_contexts
                     )
-                    
-                    # Upsample to current granularity
-                    upsampled = F.interpolate(
-                        samples,
-                        size=(curr_granularity, curr_granularity, curr_granularity),
-                        mode='trilinear',
-                        align_corners=False
-                    )
-                    
+                                            
                     # Store with file stem as key
                     for i, stem in enumerate(file_stems):
                         low_res_contexts[stem] = upsampled[i].cpu()
                     
                     # Save periodically
                     if (batch_idx + 1) % 10 == 0:
-                        self._save_context_cache(low_res_contexts, stage_idx)
+                        self._save_context_cache_with_suffix(low_res_contexts, stage_idx, cache_suffix)
                         print_main(f"  Saved {len(low_res_contexts)} contexts (checkpoint)")
+            
+                # Clear model from memory
+                del prev_model
+                if prev_low_res_contexts:
+                    del prev_low_res_contexts
+                torch.cuda.empty_cache()
             
             print_main(f"✓ Generated {len(low_res_contexts)} low-res contexts")
             
             # Final save
-            self._save_context_cache(low_res_contexts, stage_idx)
-            
-            # Clear memory
-            del prev_model
-            del prev_low_res_contexts
-            torch.cuda.empty_cache()
+            self._save_context_cache_with_suffix(low_res_contexts, stage_idx, cache_suffix)
         
         # Synchronize all ranks
         if is_distributed:
             dist.barrier()
-            low_res_contexts = self._load_context_cache(stage_idx)
+            low_res_contexts = self._load_context_cache_with_suffix(stage_idx, cache_suffix)
         
         return low_res_contexts
+
+    def _save_context_cache_with_suffix(self, contexts, stage_idx, suffix=""):
+        """Save context cache to disk with optional suffix"""
+        cache_path = f'low_res_context_stage{stage_idx}{suffix}.pth'
+        torch.save(contexts, cache_path)
+        print_main(f"✓ Context cache saved: {cache_path}")
+
+    def _load_context_cache_with_suffix(self, stage_idx, suffix=""):
+        """Load context cache from disk with optional suffix"""
+        cache_path = f'low_res_context_stage{stage_idx}{suffix}.pth'
+        if Path(cache_path).exists():
+            return torch.load(cache_path, map_location='cpu')
+        return {}
+        
     def _sample_gpu(self, model, context, shape, granularity, device, low_res_contexts=None):
         """
         Standard sampling on GPU for context generation.
@@ -3073,18 +3122,24 @@ class FSDPProgressiveGranularityTrainer:
         if use_low_res:
             prev_gran = self.granularities[stage_idx - 1]
             print_main(f"Using {prev_gran}³ as conditioning")
+            print_main(f"Low-res mode: {'Generated' if args.use_generated_low_res else 'Ground Truth'}")
         print_main(f"{'='*60}\n")
 
         if is_distributed:
             dist.barrier()
 
-        
-        # Precompute low-res contexts if needed - USE full_dataset HERE
+        # Precompute low-res contexts only if using generated mode
         low_res_contexts = {}
-        if use_low_res:
+        if use_low_res and args.use_generated_low_res:
             low_res_contexts = self.precompute_low_res_contexts(
-                stage_idx, full_dataset, device, embedding_cache  # CHANGED: full_dataset instead of train_dataset
+                stage_idx, full_dataset, device, embedding_cache,
+                use_ground_truth=False  # Generate using model
             )
+        elif use_low_res:
+            # Using ground truth - no precomputation needed
+            # The dataset will provide low_res_gt directly in each batch
+            print_main(f"Using ground truth low-res conditioning for stage {stage_idx}")
+            low_res_contexts = {}  # Empty dict signals to use batch low_res_gt
 
         stage_metrics = {
             'granularity': granularity,
@@ -3117,7 +3172,7 @@ class FSDPProgressiveGranularityTrainer:
         )
         model = initialize_model_weights(model)
 
-        # Load previous stage model weights if available
+        # Load encoder model weights if available
         if stage_idx > 0 and stage_idx - 1:
             encoder_path =Path('./train_encoder/encoder_checkpoints_stage{}_to_stage{}/best_encoder.pth'.format(stage_list[stage_idx - 1], stage_list[stage_idx]))
             if encoder_path.exists():
@@ -3319,28 +3374,44 @@ class FSDPProgressiveGranularityTrainer:
         num_batches = 0
         
         for batch_idx, batch_data in enumerate(dataloader):
-            x0, descriptions, file_stems = batch_data
+            # Unpack based on whether we have lower res data in batch (4-tuple vs 3-tuple)
+            if len(batch_data) == 4:
+                x0, low_res_gt, descriptions, file_stems = batch_data
+                low_res_gt = low_res_gt.to(device, dtype=MASTER_DTYPE)
+            else:
+                x0, descriptions, file_stems = batch_data
+                low_res_gt = None
+
             x0 = x0.to(device, dtype=MASTER_DTYPE)
             context = embedding_cache.get_batch_embeddings(descriptions, device)
             
+            # Determine which low-res source to use
             low_res_batch = None
-            if stage_idx > 0 and trainer.low_res_contexts:
-                low_res_batch = []
-                for stem in file_stems:
-                    if stem in trainer.low_res_contexts:
-                        low_res_batch.append(
-                            trainer.low_res_contexts[stem].to(device, dtype=MASTER_DTYPE).detach()
-                        )
-                    else:
-                        print_main(f"⚠ Warning: Missing low-res context for {stem}")
-                        low_res_batch.append(
-                            torch.zeros(1, x0.shape[2], x0.shape[3], x0.shape[4],
-                                    device=device, dtype=MASTER_DTYPE)
-                        )
-                
-                if low_res_batch:
-                    low_res_batch = torch.stack(low_res_batch)
-            
+            if stage_idx > 0:
+                if trainer.low_res_contexts:
+                    # Use precomputed/generated contexts
+                    low_res_batch = []
+                    for stem in file_stems:
+                        if stem in trainer.low_res_contexts:
+                            low_res_batch.append(
+                                trainer.low_res_contexts[stem].to(device, dtype=MASTER_DTYPE).detach()
+                            )
+                        else:
+                            print_main(f"⚠ Warning: Missing low-res context for {stem}")
+                            # Create zero tensor with correct lower-res shape
+                            curr_gran = x0.shape[2]  # Current granularity
+                            prev_gran = curr_gran // 2  # Previous granularity
+                            low_res_batch.append(
+                                torch.zeros(1, prev_gran, prev_gran, prev_gran,
+                                        device=device, dtype=MASTER_DTYPE)
+                            )
+                    
+                    if low_res_batch:
+                        low_res_batch = torch.stack(low_res_batch)
+                elif low_res_gt is not None:
+                    # Use ground truth low-res directly from dataset
+                    low_res_batch = low_res_gt
+
             loss = trainer.train_step(x0, context, low_res_batch)
             epoch_loss += loss
             num_batches += 1
@@ -3351,14 +3422,13 @@ class FSDPProgressiveGranularityTrainer:
         
         # Synchronize metrics across ranks
         if is_distributed:
-            # Use float64 for loss to avoid precision issues
             metrics = torch.tensor([epoch_loss, float(num_batches)], 
                                 device=device, dtype=torch.float64)
             dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
             epoch_loss = metrics[0].item()
             num_batches = int(metrics[1].item())
         
-        avg_loss = epoch_loss / max(num_batches, 1)  # Avoid division by zero
+        avg_loss = epoch_loss / max(num_batches, 1)
         return {
             'train_loss': avg_loss,
             'num_batches': num_batches
@@ -3371,7 +3441,6 @@ class FSDPProgressiveGranularityTrainer:
         total_density = 0.0
         num_batches = 0
         
-        # Determine max batches to process (same across all ranks)
         max_val_batches = min(10, len(dataloader))
         
         with torch.no_grad():
@@ -3379,21 +3448,42 @@ class FSDPProgressiveGranularityTrainer:
                 if batch_idx >= max_val_batches:
                     break
                 
-                x0, descriptions, file_stems = batch_data
+                # Unpack based on whether we have lower res data in batch
+                if len(batch_data) == 4:
+                    x0, low_res_gt, descriptions, file_stems = batch_data
+                    low_res_gt = low_res_gt.to(device, dtype=MASTER_DTYPE)
+                else:
+                    x0, descriptions, file_stems = batch_data
+                    low_res_gt = None
+                    
                 x0 = x0.to(device, dtype=MASTER_DTYPE)
                 context = embedding_cache.get_batch_embeddings(descriptions, device)
                 
+                # Determine which low-res source to use
                 low_res_batch = None
-                if stage_idx > 0 and trainer.low_res_contexts:
-                    low_res_batch = []
-                    for stem in file_stems:
-                        if stem in trainer.low_res_contexts:
-                            low_res_batch.append(
-                                trainer.low_res_contexts[stem].to(device, dtype=MASTER_DTYPE).detach()
-                            )
-                    
-                    if low_res_batch:
-                        low_res_batch = torch.stack(low_res_batch)
+                if stage_idx > 0:
+                    if trainer.low_res_contexts:
+                        # Use precomputed/generated contexts
+                        low_res_batch = []
+                        for stem in file_stems:
+                            if stem in trainer.low_res_contexts:
+                                low_res_batch.append(
+                                    trainer.low_res_contexts[stem].to(device, dtype=MASTER_DTYPE).detach()
+                                )
+                            else:
+                                print_main(f"⚠ Warning: Missing low-res context for {stem}")
+                                curr_gran = x0.shape[2]
+                                prev_gran = curr_gran // 2
+                                low_res_batch.append(
+                                    torch.zeros(1, prev_gran, prev_gran, prev_gran,
+                                            device=device, dtype=MASTER_DTYPE)
+                                )
+                        
+                        if low_res_batch:
+                            low_res_batch = torch.stack(low_res_batch)
+                    elif low_res_gt is not None:
+                        # Use ground truth low-res directly
+                        low_res_batch = low_res_gt
                 
                 batch_loss = trainer.compute_loss(x0, context, low_res_batch, backward=False)
                 val_loss += batch_loss
@@ -3406,7 +3496,7 @@ class FSDPProgressiveGranularityTrainer:
                 
                 num_batches += 1
         
-        # Synchronize across ranks - ALL ranks must participate
+        # Synchronize across ranks
         if is_distributed:
             metrics = torch.tensor(
                 [val_loss, total_occupancy, total_density, float(num_batches)], 
@@ -3423,7 +3513,7 @@ class FSDPProgressiveGranularityTrainer:
             'val_occupancy': total_occupancy / max(num_batches, 1),
             'val_density': total_density / max(num_batches, 1)
         }
-        
+
 class TrainingVoxelVisualizer:
     def __init__(self, save_dir, max_voxels=30000):
         """
@@ -3781,7 +3871,7 @@ def create_distributed_dataloaders(train_dataset, val_dataset, batch_size):
             rank=rank,
             shuffle=True,
             seed=42,
-            drop_last=True  # Important for DDP to avoid uneven batches
+            drop_last=True
         )
         
         val_sampler = DistributedSampler(
@@ -3798,23 +3888,29 @@ def create_distributed_dataloaders(train_dataset, val_dataset, batch_size):
         val_sampler = None
         shuffle_train = True
     
-    # Workers should be per-process, not multiplied by world_size
     num_workers = min(4, os.cpu_count() // max(world_size, 1))
 
     def collate_fn(batch):
-        """Custom collate to handle 3-tuple"""
-        voxels = torch.stack([item[0] for item in batch])
-        descriptions = [item[1] for item in batch]
-        file_stems = [item[2] for item in batch]  # Keep as list
-        return voxels, descriptions, file_stems
-    
+        """Custom collate to handle both 3-tuple and 4-tuple (with lower res)"""
+        # Check if we have lower res data (4-tuple vs 3-tuple)
+        if len(batch[0]) == 4:
+            voxels = torch.stack([item[0] for item in batch])
+            lower_res_voxels = torch.stack([item[1] for item in batch])
+            descriptions = [item[2] for item in batch]
+            file_stems = [item[3] for item in batch]
+            return voxels, lower_res_voxels, descriptions, file_stems
+        else:
+            voxels = torch.stack([item[0] for item in batch])
+            descriptions = [item[1] for item in batch]
+            file_stems = [item[2] for item in batch]
+            return voxels, descriptions, file_stems
     
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         sampler=train_sampler,
         shuffle=shuffle_train if train_sampler is None else False,
-        num_workers=num_workers,  # Fixed
+        num_workers=num_workers,
         pin_memory=True,
         prefetch_factor=2,  
         drop_last=True,
@@ -3827,16 +3923,16 @@ def create_distributed_dataloaders(train_dataset, val_dataset, batch_size):
         batch_size=batch_size,
         sampler=val_sampler,
         shuffle=False,
-        num_workers=num_workers,  # Fixed
+        num_workers=num_workers,
         pin_memory=True,
-        drop_last=True,  # Changed to True for DDP
+        drop_last=True,
         prefetch_factor=2,
         persistent_workers=True if num_workers > 0 else False,
         collate_fn=collate_fn
     )
     
     return train_loader, val_loader, train_sampler
-
+    
 print_main("\n" + "="*60)
 print_main("Starting Training from Scratch - Progressive Granularity")
 print_main("="*60)
@@ -3847,12 +3943,23 @@ validation_interval = args.validation_interval
 granularities = args.granularities  # e.g., [16, 32, 64]
 epochs_per_stage = args.epochs_per_stage  # e.g., [50, 100, 150]
 
+print_main(f"Granularities: {granularities}")
+print_main(f"Epochs per stage: {epochs_per_stage}")
+print_main(f"Validation interval: {validation_interval} epochs")
+print_main(f"Batch size per GPU: {batch_size}")
+print_main(f"Effective batch size: {batch_size * world_size}")
+print_main(f"Using distributed training: {is_distributed} (World Size: {world_size})")
+print_main(f"Sharding model with FSDP: {args.shard_model}")
+print_main(f"Using DDP: {args.use_ddp}")
+print_main(f"Parallel training mode: {args.parallel_training}")
+print_main(f"Skipping cache scan: {args.skip_cache_scan}")
+print_main(f"Test run mode: {args.test_run}")
+print_main("="*60 + "\n")
 
 # Initialize dataset at granularity 16 (lowest and has the most data for cache generation)
 train_dataset_3d = VoxelDataset(
-    npy_folder_path=f'/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_voxels/16', 
-    description_folder_path='/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_descriptions', 
     granularity=16, 
+    description_folder_path='/home/ad.msoe.edu/benzshawelt/Kedziora/kedziora_research/description_data_generation/objaverse_parallel/objaverse_descriptions', 
     test_count=0,  # Use full training set
     enable_fuzzy_matching=args.enable_fuzzy_matching
 )
