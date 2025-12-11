@@ -122,7 +122,6 @@ python -c '
 import torch
 print(f"  PyTorch version: {torch.__version__}")
 print(f"  CUDA version: {torch.version.cuda}")
-print(f"  SDPA available: {hasattr(torch.nn.functional, "scaled_dot_product_attention")}")
 
 # Check Flash Attention
 try:

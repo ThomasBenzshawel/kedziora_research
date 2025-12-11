@@ -75,9 +75,7 @@ def get_attention_backend_info():
 
 # Print at module load
 _attn_info = get_attention_backend_info()
-print(f"Attention backends: SDPA={_attn_info['sdpa_available']}, "
-      f"Flash={_attn_info['flash_available']}, "
-      f"MemEfficient={_attn_info['mem_efficient_available']}")
+print("Attention Backend Info:", _attn_info)
       
 
 def initialize_model_weights(model):
@@ -1404,8 +1402,6 @@ class SpatialCrossAttention(nn.Module):
         out = out.transpose(2, 3).contiguous().view(B, C, H, W)
         return self.to_out(out)
 
-
-
 class FactorizedCausalAttention(nn.Module):
     """
     Factorized Causal Attention for cross-layer dependencies.
@@ -1522,12 +1518,10 @@ class FactorizedCausalAttention(nn.Module):
         
         return output
 
-
-
 class FactorizedCausalAttentionParallel(nn.Module):
     """Updated with SDPA for spatial attention"""
     
-    def __init__(self, channels, num_heads=8, dropout=0.1, chunk_size=None, use_checkpointing=True, resolution=64):
+    def __init__(self, channels, num_heads=8, dropout=0.1, chunk_size=None, use_checkpointing=True, resolution=64, use_layer_gate=True):
         super().__init__()
         self.use_checkpointing = use_checkpointing
         self.channels = channels
@@ -1559,7 +1553,14 @@ class FactorizedCausalAttentionParallel(nn.Module):
         self.register_buffer('spatial_pos', torch.randn(1, channels, 64, 64) * 0.02)
         self.output_scale = nn.Parameter(torch.tensor([0.1]))
         self.minor_corruption_diffusion = ForwardDiffusion(timesteps=25, schedule='cosine')
-        # REMOVED: self.dropout = nn.Dropout(dropout)
+        self.use_layer_gate = use_layer_gate
+        if use_layer_gate:
+            self.gate = nn.Sequential(
+                nn.Linear(channels, channels // 4),
+                nn.SiLU(),
+                nn.Linear(channels // 4, 1),
+                nn.Sigmoid()
+            )
         
     def compute_layer_weights(self, x_noisy, x_clean):
         """Compute causal layer attention weights - manual attention needed"""
@@ -1691,14 +1692,16 @@ class FactorizedCausalAttentionParallel(nn.Module):
         # Step 3: Spatial attention (batched over layers)
         x_noisy_flat = x_noisy.view(B * L, C, H, W)
         context_flat = context.view(B * L, C, H, W)
-        
-        if self.chunk_size is not None and L > self.chunk_size:
+
+        effective_chunk = self.chunk_size or 32
+
+        if B * L > effective_chunk:
             # Process in chunks for memory efficiency
             outputs = []
-            for i in range(0, B * L, self.chunk_size):
+            for i in range(0, B * L, effective_chunk):
                 chunk_out = self.spatial_attention(
-                    x_noisy_flat[i:i+self.chunk_size],
-                    context_flat[i:i+self.chunk_size]
+                    x_noisy_flat[i:i+effective_chunk],
+                    context_flat[i:i+effective_chunk]
                 )
                 outputs.append(chunk_out)
             spatial_out = torch.cat(outputs, dim=0)
@@ -1706,6 +1709,13 @@ class FactorizedCausalAttentionParallel(nn.Module):
             spatial_out = self.spatial_attention(x_noisy_flat, context_flat)
         
         spatial_out = spatial_out.view(B, L, C, H, W)
+
+        if self.use_layer_gate:
+            # Gate based on layer position and features
+            gate_input = x_noisy.mean(dim=[-2, -1])  # [B, L, C]
+            gate = self.gate(gate_input)  # [B, L, 1]
+            gate = gate.unsqueeze(-1).unsqueeze(-1)  # [B, L, 1, 1, 1]
+            spatial_out = spatial_out * gate
         
         # Residual with scaling
         del layer_weights, context, x_noisy_flat, context_flat  # Free memory
@@ -1724,7 +1734,7 @@ class LayerXLayerDiffusionModelV4(nn.Module):
                  in_channels=1, model_channels=128, 
                  context_dim=512, attention_resolutions=[8, 16],
                  use_low_res_context=False, current_low_res_layer_context=False,
-                 factorized_attention_heads=8, spatial_attention_chunk=None,
+                 factorized_attention_heads=8, chunk_size=None, use_layer_gate=True,
                  no_teacher_forcing=False):
         super().__init__()
         self.granularity = granularity
@@ -1735,6 +1745,9 @@ class LayerXLayerDiffusionModelV4(nn.Module):
         self.use_low_res_context = use_low_res_context
         self.current_low_res_layer_context = current_low_res_layer_context
         self.no_teacher_forcing = no_teacher_forcing
+        self.use_layer_gate = use_layer_gate
+        self.chunk_size = chunk_size
+        
         
         # Layer positional embeddings
         self.layer_pos_emb = SinusoidalPosEmb(layer_context_dim)
@@ -1750,7 +1763,8 @@ class LayerXLayerDiffusionModelV4(nn.Module):
             channels=model_channels,
             num_heads=factorized_attention_heads,
             dropout=0.1,
-            chunk_size=spatial_attention_chunk  # None = no chunking
+            chunk_size=chunk_size,  # None = no chunking
+            use_layer_gate=use_layer_gate,
         )
         
         # Time embedding
@@ -2821,7 +2835,8 @@ class FSDPProgressiveGranularityTrainer:
             use_low_res_context=use_low_res_prev,
             current_low_res_layer_context=args.current_layer_only,
             factorized_attention_heads=8,
-            spatial_attention_chunk=64 if prev_granularity >= 64 else None,
+            spatial_attention_chunk=16,
+            use_layer_gate=True,
             no_teacher_forcing=args.no_teacher_forcing,
         ).to(device)
         
@@ -3167,7 +3182,8 @@ class FSDPProgressiveGranularityTrainer:
             use_low_res_context=use_low_res,
             current_low_res_layer_context=args.current_layer_only,
             factorized_attention_heads=8,
-            spatial_attention_chunk=64 if granularity >= 64 else None,  # Chunk for memory on large grids
+            chunk_size=16,
+            use_layer_gate=True,
             no_teacher_forcing=args.no_teacher_forcing,
         )
         model = initialize_model_weights(model)
@@ -3185,14 +3201,22 @@ class FSDPProgressiveGranularityTrainer:
                 print_main(f"No encoder checkpoint found at {encoder_path}, proceeding without loading encoder weights, meaning the model will output RANDOM voxels ALL the time!")
 
 
-        # Then wrap with FSDP
         if args.shard_model:
             fsdp_config = get_fsdp_config()
             model = FSDP(model, **fsdp_config)
         elif args.use_ddp:
             # For DDP, convert dtype manually
-            model = model.to(dtype=MASTER_DTYPE)
-            model = DDP(model, device_ids=[local_rank], ...)
+            model = model.to(device, dtype=MASTER_DTYPE) 
+            print_main("Wrapping model with DDP")
+            model = DDP(
+                model, 
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=True,  # Set True only if you have unused params (slower)
+                gradient_as_bucket_view=True,  # Memory optimization - reuses gradient memory
+                broadcast_buffers=True,  # Sync batch norm stats, running means, etc.
+                static_graph=True,  # Enable if your graph doesn't change between iterations (faster)
+            )
         else:
             model = model.to(dtype=MASTER_DTYPE)
 
