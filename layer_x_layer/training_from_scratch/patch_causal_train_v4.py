@@ -24,6 +24,7 @@ from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.amp import autocast, GradScaler
 from torch.utils.data import random_split
+from torch.utils.checkpoint import checkpoint
 
 
 import matplotlib.pyplot as plt
