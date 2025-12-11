@@ -7,6 +7,7 @@ import json
 from difflib import get_close_matches
 from functools import lru_cache
 from datetime import timedelta
+import gc
 
 import numpy as np
 from numpy.random import RandomState
@@ -50,6 +51,33 @@ import sqlite3
 from tqdm import tqdm
 from train_encoder.train_low_res_encoder import ResidualBlock3D, LowResContextEncoder
 
+def get_attention_backend_info():
+    """Print information about available attention backends"""
+    info = {
+        'sdpa_available': hasattr(F, 'scaled_dot_product_attention'),
+        'flash_available': False,
+        'mem_efficient_available': False,
+    }
+    
+    if torch.cuda.is_available():
+        try:
+            from torch.backends.cuda import (
+                flash_sdp_enabled,
+                mem_efficient_sdp_enabled,
+            )
+            info['flash_available'] = flash_sdp_enabled()
+            info['mem_efficient_available'] = mem_efficient_sdp_enabled()
+        except ImportError:
+            pass
+    
+    return info
+
+# Print at module load
+_attn_info = get_attention_backend_info()
+print(f"Attention backends: SDPA={_attn_info['sdpa_available']}, "
+      f"Flash={_attn_info['flash_available']}, "
+      f"MemEfficient={_attn_info['mem_efficient_available']}")
+      
 
 def initialize_model_weights(model):
     """
@@ -212,24 +240,9 @@ def get_fsdp_config():
     """
     Get FSDP configuration based on command-line arguments.
     """
-    from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
-    from torch.distributed.fsdp.wrap import _or_policy, _module_wrap_policy, size_based_auto_wrap_policy
-    from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy, transformer_auto_wrap_policy
-    import functools
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+    from functools import partial
 
-    def no_norm_wrap_policy(module):
-        # Never wrap normalization layers directly
-        if isinstance(module, (nn.GroupNorm, nn.LayerNorm, nn.BatchNorm2d)):
-            return False
-        # Wrap these specific module types
-        if isinstance(module, (ResnetBlockWithAttention, FactorizedCausalAttentionParallel)):
-            return True
-        # Also wrap any Sequential with Linear layers
-        if isinstance(module, nn.Sequential) and any(isinstance(m, nn.Linear) for m in module):
-            return True
-        return False
-    
-    
     strategy_map = {
         'FULL_SHARD': ShardingStrategy.FULL_SHARD,
         'SHARD_GRAD_OP': ShardingStrategy.SHARD_GRAD_OP,
@@ -243,26 +256,20 @@ def get_fsdp_config():
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         mixed_precision = MixedPrecision(
             param_dtype=dtype,
-            reduce_dtype=dtype,
+            reduce_dtype=torch.float32,  # Use float32 for reductions (more stable)
             buffer_dtype=dtype,
         )
     else:
         mixed_precision = None
     
-    # Use transformer-style wrapping - only wrap these specific module types
+    # Only wrap the OUTERMOST repeated blocks - avoid nesting
     auto_wrap_policy = partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={
-            # Your main blocks
-            ResnetBlockWithAttention,
-            FactorizedCausalAttentionParallel,
-            
-            # Any other custom modules with parameters
-            SinusoidalPosEmb,  # Add this
-            LowResContextEncoder,  # Add if you use it
-            MultiHeadCrossAttention,  # Add if you use it
-            
-            # You may need to add more depending on your code
+            # These are the main memory-heavy blocks that should be sharded
+            ResnetBlockWithAttention,  # Contains TransformerBlock internally
+            FactorizedCausalAttentionParallel,  # The big attention module
+            # DO NOT include modules nested inside the above
         }
     )
     
@@ -275,18 +282,15 @@ def get_fsdp_config():
         'device_id': torch.cuda.current_device(),
         'sync_module_states': True,
         'use_orig_params': True,
+        'limit_all_gathers': True,  # Add this for memory efficiency
     }
     
     print_main("FSDP Configuration:")
     print_main(f"  Sharding Strategy: {args.sharding_strategy}")
     print_main(f"  CPU Offload: {args.cpu_offload}")
     print_main(f"  Mixed Precision: {args.mixed_precision}")
-    print_main(f"  Use Original Params: True")
-    print_main(f"  Wrap Policy: transformer_auto_wrap (ResnetBlockWithAttention, FactorizedCausalAttentionParallel)")
-    print_main(f"  World Size: {world_size} GPUs")
     
     return config
-
 
 # ========== T5 EMBEDDING CACHE ==========
 
@@ -760,57 +764,59 @@ class ValidationMetrics:
         
         return metrics
 
+
 class MultiHeadSelfAttention(nn.Module):
+    """Multi-head self-attention using PyTorch's SDPA (Flash Attention when available)"""
     def __init__(self, channels, num_heads=8, dropout=0.2):
         super().__init__()
         self.channels = channels
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
+        self.dropout_p = dropout  # Store for SDPA
         
         num_groups = min(8, channels)
         while channels % num_groups != 0:
             num_groups -= 1
         self.norm = nn.GroupNorm(num_groups, channels)
 
-        self.qkv = nn.Conv2d(channels, channels * 3, 1)  # 1x1 conv for Q, K, V
+        self.qkv = nn.Conv2d(channels, channels * 3, 1)
         self.proj = nn.Conv2d(channels, channels, 1)
 
-        assert channels % num_heads == 0, f"channels {channels} must be divisible by num_heads {num_heads}"
+        assert channels % num_heads == 0
 
-        self.attn_dropout = nn.Dropout(dropout)
+        # REMOVED: self.attn_dropout = nn.Dropout(dropout)  # Not needed with SDPA
 
     def forward(self, x):
         B, C, H, W = x.shape
         
-        # Normalize
         h = self.norm(x)
-        
-        # Get Q, K, V
         qkv = self.qkv(h)
         q, k, v = qkv.chunk(3, dim=1)
         
-        # Reshape for multi-head attention
-        q = q.view(B, self.num_heads, self.head_dim, H * W).transpose(2, 3)  # [B, heads, HW, head_dim]
+        # Reshape for multi-head attention: [B, num_heads, H*W, head_dim]
+        q = q.view(B, self.num_heads, self.head_dim, H * W).transpose(2, 3)
         k = k.view(B, self.num_heads, self.head_dim, H * W).transpose(2, 3)
         v = v.view(B, self.num_heads, self.head_dim, H * W).transpose(2, 3)
         
-        # Scaled dot-product attention
-        scale = self.head_dim ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn = F.softmax(attn, dim=-1)
-        attn = self.attn_dropout(attn)
+        # === KEY CHANGE: Use PyTorch's SDPA instead of manual attention ===
+        # This automatically uses Flash Attention when available!
+        dropout_p = self.dropout_p if self.training else 0.0
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
         
-        # Apply attention to values
-        out = torch.matmul(attn, v)  # [B, heads, HW, head_dim]
+        # OLD CODE (REMOVED):
+        # scale = self.head_dim ** -0.5
+        # attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+        # attn = F.softmax(attn, dim=-1)
+        # attn = self.attn_dropout(attn)
+        # out = torch.matmul(attn, v)
+        
         out = out.transpose(2, 3).contiguous().view(B, C, H, W)
-        
-        # Project and add residual
         out = self.proj(out)
         return x + out
-    
+
 
 class MultiHeadCrossAttention(nn.Module):
-    """Updated to handle both vector and sequence context"""
+    """Cross-attention using PyTorch's SDPA (Flash Attention when available)"""
     def __init__(self, channels, context_dim, num_heads=2):
         super().__init__()
         self.channels = channels
@@ -820,10 +826,7 @@ class MultiHeadCrossAttention(nn.Module):
 
         self.norm = nn.GroupNorm(min(8, channels), channels)
         self.q = nn.Conv2d(channels, channels, 1)
-
-        # Key and Value from context sequence
-        self.to_kv = nn.Linear(context_dim, channels * 2)  # For both K and V
-        
+        self.to_kv = nn.Linear(context_dim, channels * 2)
         self.proj = nn.Conv2d(channels, channels, 1)
         
     def forward(self, x, context):
@@ -832,36 +835,31 @@ class MultiHeadCrossAttention(nn.Module):
         context: [B, seq_len, context_dim] - sequence of context vectors
         """
         B, C, H, W = x.shape
+        seq_len = context.shape[1]
         
-        # Normalize spatial features
         h = self.norm(x)
         
-        # Query from spatial features
-        q = self.q(h)  # [B, C, H, W]
-        q = q.view(B, self.num_heads, self.head_dim, H * W)
-        q = q.permute(0, 1, 3, 2)  # [B, heads, HW, head_dim]
+        # Query: [B, num_heads, H*W, head_dim]
+        q = self.q(h)
+        q = q.view(B, self.num_heads, self.head_dim, H * W).transpose(2, 3)
         
-        # Project context sequence to key and value
-        seq_len = context.shape[1]
-        kv = self.to_kv(context)  # [B, seq_len, channels * 2]
+        # Key/Value from context: [B, num_heads, seq_len, head_dim]
+        kv = self.to_kv(context)
         kv = kv.view(B, seq_len, 2, self.num_heads, self.head_dim)
-        k, v = kv[:, :, 0], kv[:, :, 1]  # Each is [B, seq_len, num_heads, head_dim]
+        k, v = kv[:, :, 0], kv[:, :, 1]
         k = k.permute(0, 2, 1, 3)  # [B, num_heads, seq_len, head_dim]
         v = v.permute(0, 2, 1, 3)
         
-        # Compute attention
-        scale = self.head_dim ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, heads, HW, seq_len]
-        attn = F.softmax(attn, dim=-1)
+        # === KEY CHANGE: Use PyTorch's SDPA ===
+        out = F.scaled_dot_product_attention(q, k, v)
         
-        # Apply attention to values
-        out = torch.matmul(attn, v)  # [B, heads, HW, head_dim]
+        # OLD CODE (REMOVED):
+        # scale = self.head_dim ** -0.5
+        # attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+        # attn = F.softmax(attn, dim=-1)
+        # out = torch.matmul(attn, v)
         
-        # Reshape back to spatial
-        out = out.permute(0, 1, 3, 2).contiguous()
-        out = out.view(B, C, H, W)
-        
-        # Output projection and residual
+        out = out.transpose(2, 3).contiguous().view(B, C, H, W)
         out = self.proj(out)
         return x + out
 
@@ -1179,6 +1177,8 @@ class MultiLayerCrossAttentionBlock(nn.Module):
         if N == 0:
             return x
         
+        device = x.device  # FIX: Use x.device, not attn.device
+        
         # Get query from current layer
         q = self.norm_q(x)
         q = self.to_q(q)
@@ -1192,14 +1192,14 @@ class MultiLayerCrossAttentionBlock(nn.Module):
         k = self.to_k(prev_layers_norm)
         v = self.to_v(prev_layers_norm)
         
-        # Reshape for multi-head attention
+        # Reshape for multi-head attention: [B, num_heads, N*HW, head_dim]
         k = k.view(B, N, self.num_heads, self.head_dim, H * W)
         k = k.permute(0, 2, 1, 4, 3).reshape(B, self.num_heads, N * H * W, self.head_dim)
         
         v = v.view(B, N, self.num_heads, self.head_dim, H * W)
         v = v.permute(0, 2, 1, 4, 3).reshape(B, self.num_heads, N * H * W, self.head_dim)
         
-        # Add positional encodings
+        # Add positional encodings to keys
         if layer_positions is not None:
             pos_emb = self.layer_pos_proj(layer_positions)
             pos_emb = pos_emb.view(B, N, self.num_heads, self.head_dim)
@@ -1208,14 +1208,9 @@ class MultiLayerCrossAttentionBlock(nn.Module):
             pos_emb = pos_emb.reshape(B, self.num_heads, N * H * W, self.head_dim)
             k = k + pos_emb
         
-        # Compute attention
-        scale = self.head_dim ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, num_heads, HW, N*HW]
-        
-        # Add relative position bias
+        # Build relative position bias
+        attn_bias = None
         if current_layer_idx is not None:
-            device = attn.device
-            
             # Previous layer indices: [0, 1, 2, ..., N-1]
             prev_indices = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)  # [B, N]
             
@@ -1233,19 +1228,19 @@ class MultiLayerCrossAttentionBlock(nn.Module):
             bias = bias.permute(0, 2, 1)  # [B, num_heads, N]
             
             # Reshape bias to match attention shape: [B, num_heads, HW, N*HW]
-            # Each spatial position gets the same layer-level bias
             bias = bias.unsqueeze(2)  # [B, num_heads, 1, N]
             bias = bias.repeat(1, 1, H * W, 1)  # [B, num_heads, HW, N]
             bias = bias.unsqueeze(-1).expand(-1, -1, -1, -1, H * W)  # [B, num_heads, HW, N, HW]
-            bias = bias.reshape(B, self.num_heads, H * W, N * H * W)  # [B, num_heads, HW, N*HW]
-            
-            # Add bias to attention scores
-            attn = attn + bias
+            attn_bias = bias.reshape(B, self.num_heads, H * W, N * H * W)  # [B, num_heads, HW, N*HW]
         
-        attn = F.softmax(attn, dim=-1)
+        # SDPA returns attended values directly [B, num_heads, HW, head_dim]
+        out = F.scaled_dot_product_attention(
+            q, k, v, 
+            attn_mask=attn_bias,
+            dropout_p=0.0
+        )
         
-        # Apply attention to values
-        out = torch.matmul(attn, v)
+        # Reshape back to spatial: [B, C, H, W]
         out = out.permute(0, 1, 3, 2).contiguous().view(B, C, H, W)
         
         # Output projection and residual
@@ -1259,11 +1254,12 @@ class CausalLayerAttention(nn.Module):
     This is a lightweight attention that operates on pooled layer representations.
     Output: attention weights [B, num_heads, L, L] with causal masking.
     """
-    def __init__(self, channels, num_heads=8, dropout=0.1):
+    def __init__(self, channels, num_heads=8, dropout=0.1, resolution=64):
         super().__init__()
         self.channels = channels
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
+        self.resolution = resolution
         
         assert channels % num_heads == 0, f"channels {channels} must be divisible by num_heads {num_heads}"
         
@@ -1276,10 +1272,10 @@ class CausalLayerAttention(nn.Module):
         self.to_k = nn.Linear(channels, channels)
         
         # Learnable layer positional embeddings
-        self.layer_pos_embed = nn.Embedding(512, channels)  # Support up to 512 layers
+        self.layer_pos_embed = nn.Embedding(self.resolution, channels)  # encodes layer index to [C]
         
         # Relative position bias (optional but helpful)
-        self.relative_pos_bias = nn.Embedding(512, num_heads)  # distance -> bias per head
+        self.relative_pos_bias = nn.Embedding(2 * self.resolution - 1, num_heads)  # distance -> bias per head
         
         self.dropout = nn.Dropout(dropout)
         self.scale = self.head_dim ** -0.5
@@ -1294,15 +1290,19 @@ class CausalLayerAttention(nn.Module):
             
         Returns:
             layer_attn_weights: [B, num_heads, L, L] - attention weights (causally masked)
+        
+        Note: Cannot use SDPA here because we need to return the attention weights
+        for layer aggregation in the factorized attention pipeline.
         """
         B, L, C, H, W = x_noisy.shape
         device = x_noisy.device
+        dtype = x_noisy.dtype
         
         # Pool spatial dimensions to get layer-level representations
         q_pooled = x_noisy.mean(dim=[-2, -1])  # [B, L, C]
         k_pooled = x_clean.mean(dim=[-2, -1])  # [B, L, C]
         
-        # Add layer positional embeddings to keys (so queries know which layer they're attending to)
+        # Add layer positional embeddings to keys
         layer_indices = torch.arange(L, device=device)
         layer_pos = self.layer_pos_embed(layer_indices)  # [L, C]
         k_pooled = k_pooled + layer_pos.unsqueeze(0)  # [B, L, C]
@@ -1311,113 +1311,98 @@ class CausalLayerAttention(nn.Module):
         q = self.to_q(self.norm_q(q_pooled))  # [B, L, C]
         k = self.to_k(self.norm_k(k_pooled))  # [B, L, C]
         
-        # Reshape for multi-head attention
-        q = q.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)  # [B, heads, L, head_dim]
-        k = k.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)  # [B, heads, L, head_dim]
+        # Reshape for multi-head attention: [B, num_heads, L, head_dim]
+        q = q.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # Compute attention scores
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B, heads, L, L]
+        # Compute attention scores: [B, num_heads, L, L]
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         
-        # Add relative position bias
-        # Distance from query layer i to key layer j is (i - j)
+        # Build combined attention bias (relative position + causal mask)
+        # Relative position bias
         query_pos = layer_indices.unsqueeze(1)  # [L, 1]
         key_pos = layer_indices.unsqueeze(0)    # [1, L]
-        relative_distance = query_pos - key_pos  # [L, L]
+        relative_distance = (query_pos - key_pos) + (L - 1)  # Shift to [0, 2L-2]
+        relative_distance = relative_distance.clamp(0, 511)  # Safety clamp for embedding
         
-        # Shift to positive indices (add L-1 so range is [0, 2L-2])
-        relative_distance_shifted = relative_distance + (L - 1)
-        relative_distance_shifted = relative_distance_shifted.clamp(0, 511)  # Safety clamp
+        rel_bias = self.relative_pos_bias(relative_distance)  # [L, L, num_heads]
+        rel_bias = rel_bias.permute(2, 0, 1)  # [num_heads, L, L]
         
-        rel_bias = self.relative_pos_bias(relative_distance_shifted)  # [L, L, num_heads]
-        rel_bias = rel_bias.permute(2, 0, 1).unsqueeze(0)  # [1, num_heads, L, L]
-        attn = attn + rel_bias
+        # Causal mask as additive bias (more efficient than boolean masking)
+        # Layer i can only attend to layers j where j < i (strict causal)
+        causal_mask = torch.triu(
+            torch.full((L, L), float('-inf'), device=device, dtype=dtype),
+            diagonal=0  # Mask diagonal and above (can't attend to self or future)
+        )  # [L, L]
         
-        # Apply causal mask: layer i can only attend to layers j where j < i
-        causal_mask = torch.triu(torch.ones(L, L, device=device, dtype=torch.bool), diagonal=0)
-        attn = attn.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+        # Combine biases: [num_heads, L, L] + [L, L] -> broadcasts correctly
+        attn_bias = rel_bias + causal_mask.unsqueeze(0)  # [num_heads, L, L]
         
-        # Softmax and handle NaN for layer 0
+        # Apply combined bias
+        attn = attn + attn_bias.unsqueeze(0)  # [B, num_heads, L, L]
+        
+        # Softmax (layer 0 will have all -inf -> NaN after softmax)
         attn = F.softmax(attn, dim=-1)
+        
+        # Handle NaN for layer 0 (has no previous layers to attend to)
         attn = torch.nan_to_num(attn, nan=0.0)
-        attn = self.dropout(attn)
+        
+        # Apply dropout during training
+        if self.training and self.dropout.p > 0:
+            attn = self.dropout(attn)
         
         return attn  # [B, num_heads, L, L]
 
 
 class SpatialCrossAttention(nn.Module):
-    """
-    Step 2 of factorized attention: WHERE to look spatially in the attended layers.
-    
-    Given a weighted combination of previous layers (preserving spatial structure),
-    the current layer performs spatial cross-attention.
-    """
+    """Spatial cross-attention using PyTorch's SDPA"""
     def __init__(self, channels, num_heads=8, dropout=0.1):
         super().__init__()
         self.channels = channels
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
+        self.dropout_p = dropout
         
-        assert channels % num_heads == 0
-        
-        # Normalization
         num_groups = min(8, channels)
         while channels % num_groups != 0:
             num_groups -= 1
         self.norm_q = nn.GroupNorm(num_groups, channels)
         self.norm_kv = nn.GroupNorm(num_groups, channels)
         
-        # Projections (using 1x1 convs to preserve spatial structure)
         self.to_q = nn.Conv2d(channels, channels, 1)
         self.to_k = nn.Conv2d(channels, channels, 1)
         self.to_v = nn.Conv2d(channels, channels, 1)
         self.to_out = nn.Conv2d(channels, channels, 1)
         
-        # Learnable 2D spatial position embeddings
         self.spatial_pos_embed = nn.Parameter(torch.randn(1, channels, 64, 64) * 0.02)
         
-        self.dropout = nn.Dropout(dropout)
-        self.scale = self.head_dim ** -0.5
+        # REMOVED: self.dropout = nn.Dropout(dropout)
         
     def forward(self, query_features, context_features):
-        """
-        Spatial cross-attention from current layer to aggregated previous layers.
-        
-        Args:
-            query_features: [B, C, H, W] - current layer features
-            context_features: [B, C, H, W] - weighted sum of previous layer features
-            
-        Returns:
-            output: [B, C, H, W] - attended features
-        """
         B, C, H, W = query_features.shape
         
-        # Add spatial positional embeddings
         if H != self.spatial_pos_embed.shape[2] or W != self.spatial_pos_embed.shape[3]:
-            spatial_pos = F.interpolate(self.spatial_pos_embed, size=(H, W), mode='bilinear', align_corners=False)
+            spatial_pos = F.interpolate(self.spatial_pos_embed, size=(H, W), 
+                                       mode='bilinear', align_corners=False)
         else:
             spatial_pos = self.spatial_pos_embed
         
-        # Normalize and add position to context (keys)
-        q = self.to_q(self.norm_q(query_features))  # [B, C, H, W]
-        k = self.to_k(self.norm_kv(context_features + spatial_pos))  # [B, C, H, W]
-        v = self.to_v(self.norm_kv(context_features))  # [B, C, H, W]
+        q = self.to_q(self.norm_q(query_features))
+        k = self.to_k(self.norm_kv(context_features + spatial_pos))
+        v = self.to_v(self.norm_kv(context_features))
         
-        # Reshape for attention: [B, num_heads, H*W, head_dim]
-        q = q.view(B, self.num_heads, self.head_dim, H * W).permute(0, 1, 3, 2)
-        k = k.view(B, self.num_heads, self.head_dim, H * W).permute(0, 1, 3, 2)
-        v = v.view(B, self.num_heads, self.head_dim, H * W).permute(0, 1, 3, 2)
+        # Reshape: [B, num_heads, H*W, head_dim]
+        q = q.view(B, self.num_heads, self.head_dim, -1).transpose(2, 3)
+        k = k.view(B, self.num_heads, self.head_dim, -1).transpose(2, 3)
+        v = v.view(B, self.num_heads, self.head_dim, -1).transpose(2, 3)
         
-        # Attention: [B, heads, H*W, H*W]
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
+        # === KEY CHANGE: Use SDPA ===
+        dropout_p = self.dropout_p if self.training else 0.0
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
         
-        # Apply attention to values
-        out = torch.matmul(attn, v)  # [B, heads, H*W, head_dim]
-        out = out.permute(0, 1, 3, 2).contiguous().view(B, C, H, W)
-        
-        out = self.to_out(out)
-        return out
+        out = out.transpose(2, 3).contiguous().view(B, C, H, W)
+        return self.to_out(out)
+
 
 
 class FactorizedCausalAttention(nn.Module):
@@ -1432,15 +1417,16 @@ class FactorizedCausalAttention(nn.Module):
     preserving spatial information across layers.
     """
     def __init__(self, channels, num_heads=8, dropout=0.1, 
-                 use_layer_gate=True, spatial_reduction=None):
+                 use_layer_gate=True, spatial_reduction=None, resolution=64):
         super().__init__()
         self.channels = channels
         self.num_heads = num_heads
         self.use_layer_gate = use_layer_gate
         self.spatial_reduction = spatial_reduction
+        self.resolution = resolution
         
         # Layer attention (which layers to attend to)
-        self.layer_attn = CausalLayerAttention(channels, num_heads, dropout)
+        self.layer_attn = CausalLayerAttention(channels, num_heads, dropout, resolution=self.resolution)
         
         # Spatial attention (where to look in aggregated context)
         self.spatial_attn = SpatialCrossAttention(channels, num_heads, dropout)
@@ -1529,34 +1515,33 @@ class FactorizedCausalAttention(nn.Module):
             # Scale attention output by gate (layer 0 gets ~0 contribution)
             spatial_out = spatial_out * gate
         
+        del layer_weights, x_noisy_flat, context_flat # free memory
         # Residual connection with learnable scale
         output = x_noisy + self.output_scale.squeeze() * spatial_out #squeeze because 0D can't be sharded, so we put it to a 1D and need to squeeze here
         
         return output
 
 
+
 class FactorizedCausalAttentionParallel(nn.Module):
-    """
-    Optimized version of FactorizedCausalAttention for parallel training.
+    """Updated with SDPA for spatial attention"""
     
-    Key optimizations:
-    - Batched operations throughout
-    - Optional chunking for memory efficiency
-    - Flash attention compatible where possible
-    """
-    def __init__(self, channels, num_heads=8, dropout=0.1, chunk_size=None):
+    def __init__(self, channels, num_heads=8, dropout=0.1, chunk_size=None, use_checkpointing=True, resolution=64):
         super().__init__()
+        self.use_checkpointing = use_checkpointing
         self.channels = channels
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
-        self.chunk_size = chunk_size  # Process layers in chunks for memory
+        self.chunk_size = chunk_size
+        self.dropout_p = dropout
+        self.resolution = resolution
         
-        # Layer attention components
+        # Layer attention components (keep manual for weight extraction)
         self.layer_norm_q = nn.LayerNorm(channels)
         self.layer_norm_k = nn.LayerNorm(channels)
         self.layer_q = nn.Linear(channels, channels)
         self.layer_k = nn.Linear(channels, channels)
-        self.layer_pos_embed = nn.Embedding(512, channels)
+        self.layer_pos_embed = nn.Embedding(self.resolution, channels)
         
         # Spatial attention components
         num_groups = min(8, channels)
@@ -1570,91 +1555,78 @@ class FactorizedCausalAttentionParallel(nn.Module):
         self.spatial_v = nn.Conv2d(channels, channels, 1)
         self.spatial_out = nn.Conv2d(channels, channels, 1)
         
-        # 2D position embedding
         self.register_buffer('spatial_pos', torch.randn(1, channels, 64, 64) * 0.02)
-        
-        self.dropout = nn.Dropout(dropout)
         self.output_scale = nn.Parameter(torch.tensor([0.1]))
-
         self.minor_corruption_diffusion = ForwardDiffusion(timesteps=25, schedule='cosine')
+        # REMOVED: self.dropout = nn.Dropout(dropout)
         
     def compute_layer_weights(self, x_noisy, x_clean):
-        """Compute causal layer attention weights."""
+        """Compute causal layer attention weights - manual attention needed"""
         B, L, C, H, W = x_noisy.shape
         device = x_noisy.device
         
-        # Pool to layer representations
-        q_pool = x_noisy.mean(dim=[-2, -1])  # [B, L, C]
-        k_pool = x_clean.mean(dim=[-2, -1])  # [B, L, C]
+        q_pool = x_noisy.mean(dim=[-2, -1])
+        k_pool = x_clean.mean(dim=[-2, -1])
         
-        # Add position to keys
         positions = torch.arange(L, device=device)
         k_pool = k_pool + self.layer_pos_embed(positions).unsqueeze(0)
         
-        # Project
-        q = self.layer_q(self.layer_norm_q(q_pool))  # [B, L, C]
-        k = self.layer_k(self.layer_norm_k(k_pool))  # [B, L, C]
+        q = self.layer_q(self.layer_norm_q(q_pool))
+        k = self.layer_k(self.layer_norm_k(k_pool))
         
-        # Multi-head reshape
         q = q.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # Attention scores
+        causal_mask = torch.triu(torch.ones(L, L, device=device, dtype=torch.bool), diagonal=0)
+        attn_bias = torch.zeros(L, L, device=device, dtype=q.dtype)
+        attn_bias.masked_fill_(causal_mask, float('-inf'))
+        
         scale = self.head_dim ** -0.5
         attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        
-        # Causal mask
-        causal_mask = torch.triu(torch.ones(L, L, device=device, dtype=torch.bool), diagonal=0)
-        attn = attn.masked_fill(causal_mask, float('-inf'))
-        
+        attn = attn + attn_bias
         attn = F.softmax(attn, dim=-1)
         attn = torch.nan_to_num(attn, nan=0.0)
         
-        return attn.mean(dim=1)  # [B, L, L] averaged across heads
+        return attn.mean(dim=1)
     
     def aggregate_context(self, layer_weights, x_clean):
-        """Aggregate previous layers using attention weights."""
         B, L, C, H, W = x_clean.shape
-        
-        # Flatten spatial
-        x_flat = x_clean.view(B, L, -1)  # [B, L, C*H*W]
-        
-        # Weighted sum
-        context = torch.bmm(layer_weights, x_flat)  # [B, L, C*H*W]
-        
+        x_flat = x_clean.view(B, L, -1)
+        context = torch.bmm(layer_weights, x_flat)
         return context.view(B, L, C, H, W)
     
     def spatial_attention(self, query, context):
-        """Apply spatial cross-attention."""
+        """=== UPDATED: Uses SDPA for spatial attention ==="""
         B_L, C, H, W = query.shape
         
-        # Interpolate spatial position if needed
         if H != 64 or W != 64:
             pos = F.interpolate(self.spatial_pos, (H, W), mode='bilinear', align_corners=False)
         else:
             pos = self.spatial_pos
         
-        # Normalize
         q = self.spatial_q(self.spatial_norm_q(query))
         k = self.spatial_k(self.spatial_norm_kv(context + pos))
         v = self.spatial_v(self.spatial_norm_kv(context))
         
-        # Reshape for attention
-        q = q.view(B_L, self.num_heads, self.head_dim, -1).permute(0, 1, 3, 2)
-        k = k.view(B_L, self.num_heads, self.head_dim, -1).permute(0, 1, 3, 2)
-        v = v.view(B_L, self.num_heads, self.head_dim, -1).permute(0, 1, 3, 2)
+        # Reshape: [B_L, num_heads, H*W, head_dim]
+        q = q.view(B_L, self.num_heads, self.head_dim, -1).transpose(2, 3)
+        k = k.view(B_L, self.num_heads, self.head_dim, -1).transpose(2, 3)
+        v = v.view(B_L, self.num_heads, self.head_dim, -1).transpose(2, 3)
         
-        # Attention
-        scale = self.head_dim ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn = F.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
+        # === KEY CHANGE: Use SDPA ===
+        dropout_p = self.dropout_p if self.training else 0.0
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
         
-        out = torch.matmul(attn, v)
-        out = out.permute(0, 1, 3, 2).contiguous().view(B_L, C, H, W)
+        # OLD CODE (REMOVED):
+        # scale = self.head_dim ** -0.5
+        # attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+        # attn = F.softmax(attn, dim=-1)
+        # attn = self.dropout(attn)
+        # out = torch.matmul(attn, v)
         
+        out = out.transpose(2, 3).contiguous().view(B_L, C, H, W)
         return self.spatial_out(out)
-
+    
 
     def create_noisy_context(self, x_clean):
         """
@@ -1683,6 +1655,15 @@ class FactorizedCausalAttentionParallel(nn.Module):
         return sqrt_a * x_clean + sqrt_1_minus_a * torch.randn_like(x_clean)
     
     def forward(self, x_noisy, x_clean, no_teacher_forcing=False):
+        if self.use_checkpointing and self.training:
+            return checkpoint(
+                self._forward_impl, 
+                x_noisy, x_clean, no_teacher_forcing,
+                use_reentrant=False
+            )
+        return self._forward_impl(x_noisy, x_clean, no_teacher_forcing)
+        
+    def _forward_impl(self, x_noisy, x_clean, no_teacher_forcing=False):
         """
         Forward pass with factorized attention.
         
@@ -1726,6 +1707,7 @@ class FactorizedCausalAttentionParallel(nn.Module):
         spatial_out = spatial_out.view(B, L, C, H, W)
         
         # Residual with scaling
+        del layer_weights, context, x_noisy_flat, context_flat  # Free memory
         return x_noisy + self.output_scale.squeeze() * spatial_out #squeeze because 0D can't be sharded, so we put it to a 1D and need to squeeze here
 
 class LayerXLayerDiffusionModelV4(nn.Module):
@@ -2162,6 +2144,8 @@ class LayerXLayerDiffusionTrainerV4:
         else:
             loss = F.mse_loss(predicted_noise.float(), noise.float())
         
+        loss_val = loss.item()
+        
         if backward:
             if args.use_ddp and args.mixed_precision:
                 self.scaler.scale(loss).backward()
@@ -2170,13 +2154,20 @@ class LayerXLayerDiffusionTrainerV4:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
+                del noise, x_noisy, all_layers, predicted_noise
+
+                if low_res_features is not None:
+                    del low_res_features
+
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
                 self.optimizer.step()
             if self.scheduler is not None:
                 self.scheduler.step()
         
-        return loss.item()
+        del loss
+        torch.cuda.empty_cache()
+        return loss_val
 
     def compute_loss_sequential(self, x0, context, low_res_context=None, backward=True, chunk_divide=2):
         """
@@ -3003,8 +2994,16 @@ class FSDPProgressiveGranularityTrainer:
                                             
                     # Store with file stem as key
                     for i, stem in enumerate(file_stems):
-                        low_res_contexts[stem] = upsampled[i].cpu()
+                        low_res_contexts[stem] = samples[i].cpu()
                     
+
+                    del x0, context, samples
+                    if batch_prev_contexts is not None:
+                        del batch_prev_contexts
+                    
+                    if (batch_idx + 1) % 5 == 0:
+                        torch.cuda.empty_cache()
+                        
                     # Save periodically
                     if (batch_idx + 1) % 10 == 0:
                         self._save_context_cache_with_suffix(low_res_contexts, stage_idx, cache_suffix)
@@ -3184,29 +3183,36 @@ class FSDPProgressiveGranularityTrainer:
             else:
                 print_main(f"No encoder checkpoint found at {encoder_path}, proceeding without loading encoder weights, meaning the model will output RANDOM voxels ALL the time!")
 
-        # Convert to target dtype
-        model = model.to(dtype=MASTER_DTYPE).to(device)
 
         # Then wrap with FSDP
         if args.shard_model:
             fsdp_config = get_fsdp_config()
             model = FSDP(model, **fsdp_config)
-
-        if args.use_ddp:
-            print_main("Wrapping model with DDP")
-            model = DDP(
-                model, 
-                device_ids=[local_rank],  # Use local_rank (int), not device
-                output_device=local_rank,
-                find_unused_parameters=False,  # Set True if you have unused params (slower)
-                gradient_as_bucket_view=True,  # Memory optimization
-                broadcast_buffers=True,  # Sync batch norm stats etc.
-            )
+        elif args.use_ddp:
+            # For DDP, convert dtype manually
+            model = model.to(dtype=MASTER_DTYPE)
+            model = DDP(model, device_ids=[local_rank], ...)
+        else:
+            model = model.to(dtype=MASTER_DTYPE)
 
         # model = torch.compile(model, mode='max-autotune', fullgraph=True)
         
         print_main("✓ Model created and compiled")
         print_main("Model has", sum(p.numel() for p in model.parameters()), "parameters")
+
+        if args.shard_model:
+            fsdp_config = get_fsdp_config()
+            model = FSDP(model, **fsdp_config)
+            
+            # Diagnostic: count FSDP units
+            fsdp_units = sum(1 for m in model.modules() if isinstance(m, FSDP))
+            print_main(f"Number of FSDP units: {fsdp_units}")
+            
+            # Check parameter sharding
+            for name, param in model.named_parameters():
+                if hasattr(param, '_is_sharded'):
+                    print_main(f"  {name}: sharded={param._is_sharded}")
+                break  # Just check first few
 
         if is_distributed:
             dist.barrier()
@@ -3335,6 +3341,7 @@ class FSDPProgressiveGranularityTrainer:
                         del t5_model
                         del t5_tokenizer
                         torch.cuda.empty_cache()
+                        gc.collect()
                 
                 # Synchronize after visualization
                 if is_distributed:
@@ -3358,14 +3365,16 @@ class FSDPProgressiveGranularityTrainer:
         # Save checkpoint for next stage
         self.save_stage_checkpoint(model, stage_idx, device)
         
-        # Clean up
-        del model
-        del trainer
+        del model, trainer, diffusion
+        del train_loader, val_loader
+        if low_res_contexts:
+            del low_res_contexts
         torch.cuda.empty_cache()
-        
+        gc.collect()
+
         if is_distributed:
             dist.barrier()
-        
+
         return stage_metrics
         
     def _train_epoch(self, trainer, dataloader, embedding_cache, device, epoch, stage_idx):
@@ -3416,6 +3425,10 @@ class FSDPProgressiveGranularityTrainer:
             epoch_loss += loss
             num_batches += 1
             
+            del x0, context, low_res_batch
+            if low_res_gt is not None:
+                del low_res_gt
+                    
             if rank == 0 and (batch_idx + 1) % 50 == 0:
                 avg_loss = epoch_loss / num_batches
                 print(f"  Batch {batch_idx + 1}/{len(dataloader)} - Avg Loss: {avg_loss:.4f}")
@@ -3495,6 +3508,10 @@ class FSDPProgressiveGranularityTrainer:
                 total_density += density
                 
                 num_batches += 1
+
+                del x0, context, low_res_batch, batch_data
+                if low_res_gt is not None:
+                    del low_res_gt
         
         # Synchronize across ranks
         if is_distributed:
@@ -3686,10 +3703,6 @@ class TrainingVoxelVisualizer:
                 print(f"Generating {num_samples} voxel samples ({granularity}³ resolution) using {sampling_method}...")
                 if trainer.use_ddim:
                     samples = self._generate_with_progress_ddim(
-                        trainer, context, num_samples, granularity, device
-                    )
-                else:
-                    samples = self._generate_with_progress(
                         trainer, context, num_samples, granularity, device
                     )
             else:

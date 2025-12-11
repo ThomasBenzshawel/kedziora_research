@@ -52,6 +52,97 @@ echo "PyTorch version: $(python -c 'import torch; print(torch.__version__)')"
 echo "CUDA available: $(python -c 'import torch; print(torch.cuda.is_available())')"
 echo "Number of GPUs: $(python -c 'import torch; print(torch.cuda.device_count())')"
 
+# =============================================================================
+# Flash Attention Installation (Optional - falls back to SDPA if unavailable)
+# =============================================================================
+
+echo "=========================================="
+echo "Checking Flash Attention"
+echo "=========================================="
+
+# Check if flash_attn is already installed and working
+FLASH_ATTN_STATUS=$(python -c '
+try:
+    import flash_attn
+    print(f"INSTALLED:{flash_attn.__version__}")
+except ImportError:
+    print("NOT_INSTALLED")
+except Exception as e:
+    print(f"ERROR:{e}")
+' 2>/dev/null)
+
+if [[ "$FLASH_ATTN_STATUS" == INSTALLED:* ]]; then
+    echo "✓ Flash Attention already installed: ${FLASH_ATTN_STATUS#INSTALLED:}"
+elif [[ "$FLASH_ATTN_STATUS" == "NOT_INSTALLED" ]]; then
+    echo "Flash Attention not found. Attempting installation..."
+    echo "Note: This may take 5-10 minutes to compile. Training will use PyTorch SDPA as fallback if this fails."
+    
+    # Get CUDA version for logging
+    CUDA_VERSION=$(python -c 'import torch; print(torch.version.cuda)' 2>/dev/null)
+    echo "Detected CUDA version: $CUDA_VERSION"
+    
+    # Attempt installation with timeout (15 minutes max)
+    # Using --no-build-isolation to use existing PyTorch/CUDA
+    timeout 900 pip install flash-attn --no-build-isolation 2>&1 | tee /tmp/flash_attn_install_${SLURM_JOB_ID}.log
+    INSTALL_EXIT_CODE=${PIPESTATUS[0]}
+    
+    if [ $INSTALL_EXIT_CODE -eq 0 ]; then
+        # Verify installation worked
+        VERIFY_STATUS=$(python -c '
+try:
+    import flash_attn
+    print(f"SUCCESS:{flash_attn.__version__}")
+except Exception as e:
+    print(f"FAILED:{e}")
+' 2>/dev/null)
+        
+        if [[ "$VERIFY_STATUS" == SUCCESS:* ]]; then
+            echo "✓ Flash Attention installed successfully: ${VERIFY_STATUS#SUCCESS:}"
+        else
+            echo "⚠ Flash Attention installation completed but import failed: ${VERIFY_STATUS#FAILED:}"
+            echo "  Training will continue using PyTorch's built-in SDPA (still fast on Ampere+ GPUs)"
+        fi
+    elif [ $INSTALL_EXIT_CODE -eq 124 ]; then
+        echo "⚠ Flash Attention installation timed out after 15 minutes"
+        echo "  Training will continue using PyTorch's built-in SDPA"
+    else
+        echo "⚠ Flash Attention installation failed (exit code: $INSTALL_EXIT_CODE)"
+        echo "  Check /tmp/flash_attn_install_${SLURM_JOB_ID}.log for details"
+        echo "  Training will continue using PyTorch's built-in SDPA (still fast on Ampere+ GPUs)"
+    fi
+else
+    echo "⚠ Flash Attention check returned unexpected status: $FLASH_ATTN_STATUS"
+    echo "  Training will continue using PyTorch's built-in SDPA"
+fi
+
+# Final status check - report what attention backend will be used
+echo ""
+echo "Attention Backend Status:"
+python -c '
+import torch
+print(f"  PyTorch version: {torch.__version__}")
+print(f"  CUDA version: {torch.version.cuda}")
+print(f"  SDPA available: {hasattr(torch.nn.functional, "scaled_dot_product_attention")}")
+
+# Check Flash Attention
+try:
+    import flash_attn
+    print(f"  Flash Attention: ✓ {flash_attn.__version__}")
+except ImportError:
+    print("  Flash Attention: ✗ Not installed (using SDPA fallback)")
+
+# Check SDPA backends
+if torch.cuda.is_available():
+    try:
+        from torch.backends.cuda import flash_sdp_enabled, mem_efficient_sdp_enabled, math_sdp_enabled
+        print(f"  SDPA Flash backend: {flash_sdp_enabled()}")
+        print(f"  SDPA Memory-efficient backend: {mem_efficient_sdp_enabled()}")
+        print(f"  SDPA Math backend: {math_sdp_enabled()}")
+    except ImportError:
+        print("  SDPA backend info: Not available (older PyTorch version)")
+'
+echo "=========================================="
+
 # Create necessary directories
 mkdir -p logs
 mkdir -p checkpoints
